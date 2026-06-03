@@ -20,3 +20,8 @@ compile_commands.json
 *.cppr
 *.hr
 *.log
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+playground

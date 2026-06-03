@@ -1,0 +1,18 @@
+[workspace]
+authors = ["ethanc8 <echaroenpitaks@gmail.com>"]
+channels = ["conda-forge"]
+name = "loom"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+clang = ">=22.1.6,<23"
+coin-or-cbc = ">=2.10.13,<3"
+libzip = ">=1.11.2,<2"
+python = ">=3.14.5,<3.15"
+
+[pypi-dependencies]
+combine-gtfs-feeds = ">=0.1.9, <0.2"
+gtfsmerger = ">=0.1.6, <0.2"
