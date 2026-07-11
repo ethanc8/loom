@@ -432,10 +432,13 @@ void MvtRenderer::renderEdgeTripGeom(const RenderGraph& outG,
       oCss = lo.style.get().getOutlineCss();
     }
 
+    std::string color =
+        lo.colorOverride.empty() ? line->color() : lo.colorOverride;
+
     if (_cfg->outlineWidth > 0) {
       Params paramsOut;
       paramsOut["color"] = "000000";
-      paramsOut["line-color"] = line->color();
+      paramsOut["line-color"] = color;
       paramsOut["line"] = line->label();
       paramsOut["lineCap"] = "butt";
       paramsOut["class"] = getLineClass(line->id());
@@ -449,8 +452,8 @@ void MvtRenderer::renderEdgeTripGeom(const RenderGraph& outG,
     }
 
     Params params;
-    params["color"] = line->color();
-    params["line-color"] = line->color();
+    params["color"] = color;
+    params["line-color"] = color;
     params["line"] = line->label();
     params["lineCap"] = "round";
     params["class"] = getLineClass(line->id());

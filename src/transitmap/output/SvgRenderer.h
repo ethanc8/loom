@@ -85,13 +85,15 @@ class SvgRenderer : public Renderer {
   void renderLinePart(const util::geo::PolyLine<double> p, double width,
                       const shared::linegraph::Line& line,
                       const std::string& css,
-                      const std::string& oCss);
+                      const std::string& oCss,
+                      const std::string& colorOverride = "");
 
   void renderLinePart(const util::geo::PolyLine<double> p, double width,
                       const shared::linegraph::Line& line,
                       const std::string& css,
                       const std::string& oCss,
-                      const std::string& endMarker);
+                      const std::string& endMarker,
+                      const std::string& colorOverride);
 
   void renderDelegates(const shared::rendergraph::RenderGraph& outG,
                        const RenderParams& params);

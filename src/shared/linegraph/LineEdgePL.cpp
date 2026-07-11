@@ -113,6 +113,7 @@ util::json::Dict LineEdgePL::getAttrs() const {
       if (r.style.get().getOutlineCss().size())
         line["outline-style"] = r.style.get().getOutlineCss();
     }
+    if (!r.colorOverride.empty()) line["freq_color"] = r.colorOverride;
 
     if (r.direction != 0) {
       line["direction"] = util::toString(r.direction);
@@ -146,6 +147,12 @@ const LineOcc& LineEdgePL::lineOccAtPos(size_t i) const { return _lines[i]; }
 // _____________________________________________________________________________
 void LineEdgePL::updateLineOcc(const LineOcc& occ) {
   _lines[_lineToIdx.find(occ.line)->second] = occ;
+}
+
+// _____________________________________________________________________________
+void LineEdgePL::setColorOverride(const Line* l, const std::string& color) {
+  auto it = _lineToIdx.find(l);
+  if (it != _lineToIdx.end()) _lines[it->second].colorOverride = color;
 }
 
 // _____________________________________________________________________________

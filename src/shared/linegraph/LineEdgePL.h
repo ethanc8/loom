@@ -35,6 +35,7 @@ struct LineOcc {
   const Node<LineNodePL, LineEdgePL>* direction;  // 0 if in both directions
 
   util::Nullable<shared::style::LineStyle> style;
+  std::string colorOverride;  // per-edge color set by freq.py; overrides line->color()
 };
 
 inline bool operator<(const LineOcc& x, const LineOcc& y) {
@@ -79,6 +80,7 @@ class LineEdgePL : util::geograph::GeoEdgePL<double> {
   const LineOcc& lineOccAtPos(size_t i) const;
 
   void updateLineOcc(const LineOcc& occ);
+  void setColorOverride(const Line* l, const std::string& color);
 
   size_t linePos(const Line* r) const;
 

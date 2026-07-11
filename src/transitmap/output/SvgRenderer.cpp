@@ -450,15 +450,17 @@ void SvgRenderer::renderClique(const InnerClique& cc, const LineNode* n) {
 // _____________________________________________________________________________
 void SvgRenderer::renderLinePart(const PolyLine<double> p, double width,
                                  const Line& line, const std::string& css,
-                                 const std::string& oCss) {
-  renderLinePart(p, width, line, css, oCss, "");
+                                 const std::string& oCss,
+                                 const std::string& colorOverride) {
+  renderLinePart(p, width, line, css, oCss, "", colorOverride);
 }
 
 // _____________________________________________________________________________
 void SvgRenderer::renderLinePart(const PolyLine<double> p, double width,
                                  const Line& line, const std::string& css,
                                  const std::string& oCss,
-                                 const std::string& endMarker) {
+                                 const std::string& endMarker,
+                                 const std::string& colorOverride) {
   std::stringstream styleOutline;
   styleOutline << "fill:none;stroke:#000000;stroke-linecap:round;stroke-width:"
                << (width + _cfg->outlineWidth) * _cfg->outputResolution << ";"
@@ -467,8 +469,9 @@ void SvgRenderer::renderLinePart(const PolyLine<double> p, double width,
   paramsOutline["style"] = styleOutline.str();
   paramsOutline["class"] = "transit-edge-outline " + getLineClass(line.id());
 
+  std::string color = colorOverride.empty() ? line.color() : colorOverride;
   std::stringstream styleStr;
-  styleStr << "fill:none;stroke:#" << line.color() << ";" << css;
+  styleStr << "fill:none;stroke:#" << color << ";" << css;
 
   if (!endMarker.empty()) {
     styleStr << ";marker-end:url(#" << endMarker << ")";
@@ -558,15 +561,16 @@ void SvgRenderer::renderEdgeTripGeom(const RenderGraph& outG,
 
       if (lo.direction == e->getTo()) {
         renderLinePart(firstPart, lineW, *line, css, oCss,
-                       markerName.str() + "_m");
-        renderLinePart(secondPart.reversed(), lineW, *line, css, oCss);
+                       markerName.str() + "_m", lo.colorOverride);
+        renderLinePart(secondPart.reversed(), lineW, *line, css, oCss,
+                       lo.colorOverride);
       } else {
         renderLinePart(secondPart.reversed(), lineW, *line, css, oCss,
-                       markerName.str() + "_m");
-        renderLinePart(firstPart, lineW, *line, css, oCss);
+                       markerName.str() + "_m", lo.colorOverride);
+        renderLinePart(firstPart, lineW, *line, css, oCss, lo.colorOverride);
       }
     } else {
-      renderLinePart(p, lineW, *line, css, oCss);
+      renderLinePart(p, lineW, *line, css, oCss, lo.colorOverride);
     }
 
     o -= offsetStep;
