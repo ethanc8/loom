@@ -10,7 +10,6 @@ CMakeFiles
 *.cmake
 /build/
 *.pyc
-compile_commands.json
 .vimrc
 .clang_complete
 /.idea
@@ -25,3 +24,7 @@ compile_commands.json
 !.pixi/config.toml
 
 # playground
+
+# clangd
+compile_commands.json
+.cache
