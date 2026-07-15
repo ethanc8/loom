@@ -35,6 +35,16 @@ using util::geo::LinePointCmp;
 using util::geo::Polygon;
 using util::geo::PolyLine;
 
+// _____________________________________________________________________________
+namespace {
+// the color a partner's line is rendered with on its edge: the per-edge
+// freq_color override if present, else the shared Line object's color
+std::string effectiveColor(const shared::linegraph::Partner& p) {
+  const auto& lo = p.edge->pl().lineOcc(p.line);
+  return lo.colorOverride.empty() ? p.line->color() : lo.colorOverride;
+}
+}  // namespace
+
 const static double TILE_RES = 1024;
 
 // ground width/height of a single tile on zoom level 0
@@ -347,34 +357,62 @@ void MvtRenderer::renderClique(const InnerClique& cc, const LineNode* n) {
         }
       }
 
-      if (_cfg->outlineWidth > 0) {
-        Params paramsOut;
-        paramsOut["color"] = "000000";
-        paramsOut["line-color"] = c.geoms[i].from.line->color();
-        paramsOut["line"] = c.geoms[i].from.line->label();
-        paramsOut["lineCap"] = "butt";
-        paramsOut["class"] = getLineClass(c.geoms[i].from.line->id());
-        paramsOut["width"] =
-            util::toString((2.0 * _cfg->outlineWidth + _cfg->lineWidth));
+      std::string fromColor = effectiveColor(c.geoms[i].from);
+      std::string toColor =
+          c.geoms[i].to.edge ? effectiveColor(c.geoms[i].to) : fromColor;
 
-        if (n->pl().getComponent() != std::numeric_limits<uint32_t>::max())
-          paramsOut["component"] = util::toString(n->pl().getComponent());
-
-        addFeature({pl.getLine(), "inner-connections", paramsOut});
+      // MapLibre cannot gradient-stroke a single feature, so an arc whose
+      // sides have different colors is split at its midpoint into two
+      // solid-colored features. pl may be an offsetted copy of the clique's
+      // ref geom, whose orientation is not necessarily this geom's from->to
+      // orientation; assign the halves by which end lies at the from edge's
+      // node front.
+      std::vector<std::pair<PolyLine<double>, std::string>> parts;
+      if (fromColor == toColor) {
+        parts.push_back({pl, fromColor});
+      } else {
+        std::string cA = fromColor, cB = toColor;
+        auto fromFront = n->pl().frontFor(c.geoms[i].from.edge);
+        if (fromFront &&
+            util::geo::dist(fromFront->geom.getLine(), pl.getLine().back()) <
+                util::geo::dist(fromFront->geom.getLine(),
+                                pl.getLine().front())) {
+          std::swap(cA, cB);
+        }
+        parts.push_back({pl.getSegment(0, 0.5), cA});
+        parts.push_back({pl.getSegment(0.5, 1), cB});
       }
 
-      Params params;
-      params["color"] = c.geoms[i].from.line->color();
-      params["line-color"] = c.geoms[i].from.line->color();
-      params["line"] = c.geoms[i].from.line->label();
-      params["lineCap"] = "round";
-      params["class"] = getLineClass(c.geoms[i].from.line->id());
-      params["width"] = util::toString(_cfg->lineWidth);
+      for (const auto& part : parts) {
+        if (_cfg->outlineWidth > 0) {
+          Params paramsOut;
+          paramsOut["color"] = "000000";
+          paramsOut["line-color"] = part.second;
+          paramsOut["line"] = c.geoms[i].from.line->label();
+          paramsOut["lineCap"] = "butt";
+          paramsOut["class"] = getLineClass(c.geoms[i].from.line->id());
+          paramsOut["width"] =
+              util::toString((2.0 * _cfg->outlineWidth + _cfg->lineWidth));
 
-      if (n->pl().getComponent() != std::numeric_limits<uint32_t>::max())
-        params["component"] = util::toString(n->pl().getComponent());
+          if (n->pl().getComponent() != std::numeric_limits<uint32_t>::max())
+            paramsOut["component"] = util::toString(n->pl().getComponent());
 
-      addFeature({pl.getLine(), "inner-connections", params});
+          addFeature({part.first.getLine(), "inner-connections", paramsOut});
+        }
+
+        Params params;
+        params["color"] = part.second;
+        params["line-color"] = part.second;
+        params["line"] = c.geoms[i].from.line->label();
+        params["lineCap"] = "round";
+        params["class"] = getLineClass(c.geoms[i].from.line->id());
+        params["width"] = util::toString(_cfg->lineWidth);
+
+        if (n->pl().getComponent() != std::numeric_limits<uint32_t>::max())
+          params["component"] = util::toString(n->pl().getComponent());
+
+        addFeature({part.first.getLine(), "inner-connections", params});
+      }
     }
   }
 }

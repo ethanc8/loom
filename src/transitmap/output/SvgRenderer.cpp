@@ -32,6 +32,16 @@ using util::geo::PolyLine;
 using util::DEBUG;
 
 // _____________________________________________________________________________
+namespace {
+// the color a partner's line is rendered with on its edge: the per-edge
+// freq_color override if present, else the shared Line object's color
+std::string effectiveColor(const shared::linegraph::Partner& p) {
+  const auto& lo = p.edge->pl().lineOcc(p.line);
+  return lo.colorOverride.empty() ? p.line->color() : lo.colorOverride;
+}
+}  // namespace
+
+// _____________________________________________________________________________
 SvgRenderer::SvgRenderer(std::ostream* o, const config::Config* cfg)
     : _o(o), _w(o, true), _cfg(cfg) {}
 
@@ -430,8 +440,31 @@ void SvgRenderer::renderClique(const InnerClique& cc, const LineNode* n) {
       paramsOutlineCropped["class"] +=
           " " + getLineClass(c.geoms[i].from.line->id());
 
+      std::string fromColor = effectiveColor(c.geoms[i].from);
+      std::string toColor =
+          c.geoms[i].to.edge ? effectiveColor(c.geoms[i].to) : fromColor;
+
+      std::string stroke = "#" + fromColor;
+      if (fromColor != toColor) {
+        // pl may be an offsetted copy of the clique's ref geom, whose
+        // orientation is not necessarily this geom's from->to orientation;
+        // assign the stops by which end lies at the from edge's node front
+        std::string cA = fromColor, cB = toColor;
+        auto fromFront = n->pl().frontFor(c.geoms[i].from.edge);
+        if (fromFront &&
+            util::geo::dist(fromFront->geom.getLine(), pl.getLine().back()) <
+                util::geo::dist(fromFront->geom.getLine(),
+                                pl.getLine().front())) {
+          std::swap(cA, cB);
+        }
+        std::string gradId = "grad" + util::toString(_gradients.size());
+        _gradients.push_back(LineGradient(gradId, pl.getLine().front(),
+                                          pl.getLine().back(), cA, cB));
+        stroke = "url(#" + gradId + ")";
+      }
+
       std::stringstream styleStr;
-      styleStr << "fill:none;stroke:#" << c.geoms[i].from.line->color();
+      styleStr << "fill:none;stroke:" << stroke;
 
       styleStr << ";stroke-linecap:round;stroke-opacity:1;stroke-width:"
                << _cfg->lineWidth * _cfg->outputResolution;
@@ -587,6 +620,41 @@ std::string SvgRenderer::getMarkerPathMale(double w) const {
 void SvgRenderer::renderDelegates(const RenderGraph& outG,
                                   const RenderParams& rparams) {
   UNUSED(outG);
+  if (_gradients.size()) {
+    _w.openTag("defs");
+    for (const auto& g : _gradients) {
+      std::map<std::string, std::string> params;
+      params["id"] = g.id;
+      params["gradientUnits"] = "userSpaceOnUse";
+      params["x1"] = std::to_string((g.from.getX() - rparams.xOff) *
+                                    _cfg->outputResolution);
+      params["y1"] =
+          std::to_string(rparams.height - (g.from.getY() - rparams.yOff) *
+                                              _cfg->outputResolution);
+      params["x2"] = std::to_string((g.to.getX() - rparams.xOff) *
+                                    _cfg->outputResolution);
+      params["y2"] =
+          std::to_string(rparams.height - (g.to.getY() - rparams.yOff) *
+                                              _cfg->outputResolution);
+      _w.openTag("linearGradient", params);
+
+      params.clear();
+      params["offset"] = "0";
+      params["stop-color"] = "#" + g.fromColor;
+      _w.openTag("stop", params);
+      _w.closeTag();
+
+      params.clear();
+      params["offset"] = "1";
+      params["stop-color"] = "#" + g.toColor;
+      _w.openTag("stop", params);
+      _w.closeTag();
+
+      _w.closeTag();
+    }
+    _w.closeTag();
+  }
+
   for (auto& a : _delegates) {
     _w.openTag("g");
     for (auto& pd : a.second) {

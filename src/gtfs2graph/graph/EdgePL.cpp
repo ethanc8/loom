@@ -186,8 +186,10 @@ util::json::Dict EdgePL::getAttrs() const {
 
   for (auto r : getRefETG()->getTripsUnordered()) {
     util::json::Dict route;
-    route["id"] = util::toString(r.route);
-    route["label"] = r.route->getShortName();
+    route["id"] = r.route->getId();
+    route["label"] = r.route->getShortName().empty()
+                         ? r.route->getLongName()
+                         : r.route->getShortName();
     route["color"] = r.route->getColorString();
 
     if (r.direction != 0) {

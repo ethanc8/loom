@@ -123,7 +123,7 @@ util::json::Dict NodePL::getAttrs() const {
                (r.direction != _n && rr.direction == _n)) &&
               !isConnOccuring(r.route, e, f)) {
             auto obj = util::json::Dict();
-            obj["line"] = util::toString(r.route);
+            obj["line"] = r.route->getId();
             obj["node_from"] =
                 util::toString(e->getFrom() == _n ? e->getTo() : e->getFrom());
             obj["node_to"] =

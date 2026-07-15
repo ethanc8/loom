@@ -33,6 +33,16 @@ struct EndMarker {
   double width, height;
 };
 
+struct LineGradient {
+  LineGradient(const std::string& id, const util::geo::DPoint& from,
+               const util::geo::DPoint& to, const std::string& fromColor,
+               const std::string& toColor)
+      : id(id), from(from), to(to), fromColor(fromColor), toColor(toColor) {}
+  std::string id;
+  util::geo::DPoint from, to;
+  std::string fromColor, toColor;
+};
+
 class SvgRenderer : public Renderer {
  public:
   SvgRenderer(std::ostream* o, const config::Config* cfg);
@@ -66,6 +76,7 @@ class SvgRenderer : public Renderer {
   std::vector<std::map<uintptr_t, std::vector<OutlinePrintPair>>>
       _innerDelegates;
   std::vector<EndMarker> _markers;
+  std::vector<LineGradient> _gradients;
   mutable std::map<std::string, int> lineClassIds;
   mutable int lineClassId = 0;
 
