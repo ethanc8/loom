@@ -1,0 +1,51 @@
+[window]
+# A specific calendar date. Active service_ids are resolved from calendar.txt
+# and calendar_dates.txt. Use a typical midday weekday (Tuesday or Wednesday,
+# when school is in session, no public holidays).
+date = "2026-07-15"
+start_time = "10:00"   # HH:MM 24-hour. Times >= 24:00 are allowed (GTFS convention),
+end_time   = "14:00"   # e.g. a late-evening window may be "22:00" - "26:00".
+
+[metric]
+# How to aggregate inter-trip gaps within the window.
+# "max"    - longest gap (worst-case wait)
+# "mean"   - arithmetic mean of all gaps
+# "median" - 50th-percentile gap (robust to outliers)
+type = "median"
+
+# Frequency buckets, evaluated in order (smallest max_headway_min first).
+# The first bucket where max_headway_min >= computed headway is used.
+# max_headway_min = "inf" is the catch-all (matches any headway).
+# color: 6-digit hex WITHOUT '#'.
+# OMITTING color makes the bucket invisible (TOML has no null type): its line
+# entries are removed from the output JSON, and edges that become empty are
+# also removed entirely. Invisible routes do not appear in the transitmap
+# output.
+[[buckets]]
+max_headway_min = 10
+color = "#d32f2f"
+
+[[buckets]]
+max_headway_min = 15
+color = "#f57c00"
+
+[[buckets]]
+max_headway_min = 20
+color = "#fbc02d"
+
+[[buckets]]
+max_headway_min = 30
+color = "#388e3c"
+
+[[buckets]]
+max_headway_min = 60
+color = "#1976d2"
+
+[[buckets]]
+max_headway_min = "inf"
+color = "#9e9e9e"
+
+# Routes with zero qualifying trips in the window.
+# Omit color to make them invisible (removed from output).
+[no_service]
+color = "#cccccc"   # uncomment to render no-service routes in grey
