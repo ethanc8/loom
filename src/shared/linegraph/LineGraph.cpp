@@ -1484,7 +1484,8 @@ void LineGraph::extractLine(const nlohmann::json::object_t& line, LineEdge* e,
 
   if (line.count("freq_color")) {
     std::string fc = line.at("freq_color").get<std::string>();
-    if (!fc.empty()) e->pl().setColorOverride(l, util::normHtmlColor(fc));
+    fc = util::normHtmlColor(util::trim(util::trim(fc, "\""), "#"));
+    if (!fc.empty()) e->pl().setColorOverride(l, fc);
   }
 }
 

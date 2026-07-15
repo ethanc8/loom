@@ -11,7 +11,7 @@ end_time   = "14:00"   # e.g. a late-evening window may be "22:00" - "26:00".
 # "max"    - longest gap (worst-case wait)
 # "mean"   - arithmetic mean of all gaps
 # "median" - 50th-percentile gap (robust to outliers)
-type = "median"
+type = "mean"
 
 # Frequency buckets, evaluated in order (smallest max_headway_min first).
 # The first bucket where max_headway_min >= computed headway is used.

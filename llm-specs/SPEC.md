@@ -285,26 +285,28 @@ node_map = {f["properties"]["id"]: f for f in features if f["geometry"]["type"] 
 edges = [f for f in features if f["geometry"]["type"] == "LineString"]
 ```
 
-### Step 6 — Resolve the stop_id for a node, given a specific route
+### Step 6 — Resolve the candidate stop_ids for a node, given a specific route
 
-Called for the `from` and `to` node of each edge, per route. Memoize on `(node_id, route_id)`.
+Called for the `from` and `to` node of each edge, per route. Memoize on `(node_id, route_id)`. Returns a **(possibly empty) set of stop_ids**, not a single stop:
 
 ```python
-def resolve_stop(node, route_id):
+def resolve_stops(node, route_id) -> frozenset:
+    cands = set()
     sid = node["properties"].get("station_id", "")
     if sid and sid in route_stops.get(route_id, {}):
-        return sid    # fast path: station_id is valid for this route
-
-    # Geographic fallback: brute-force haversine against route_stops[route_id];
-    # accept the nearest stop within 200 m. Return None if none found.
+        cands.add(sid)    # station_id is valid for this route
+    # plus ALL stops of the route within 200 m of the node
+    # (brute-force haversine against route_stops[route_id])
     ...
 ```
 
-**200 m threshold** (not 100 m): suburban Pace routes have stops spaced 500 m–1 km apart; topo intersection nodes can be up to ~150 m from the nearest stop on dense city grids. 200 m provides enough slack while excluding clearly wrong matches.
+**Why a set** (found empirically on the 2026-07 Chicagoland feeds): the two travel directions of a street use distinct GTFS stops a few metres apart on opposite curbs, and a topo node stands for the whole street corner. Resolving each node to a *single* nearest stop picks a curb arbitrarily; when an edge's two nodes pick opposite curbs (e.g. `pace_226e0245` / `pace_226w0250`), **no single trip visits both stops** and the segment is falsely classified no_service — on the real data this hit 79% of resolved no_service entries and made frequent routes flicker between their color and no_service every few edges. With candidate sets, a trip qualifies if it visits *any* from-candidate and *any* to-candidate (Step 7 merges the occurrence lists per set), which is direction-blind and immune to curb choice.
 
-Always validate station_id against `route_stops[route_id]` even when station_id is present — a node may carry the stop_id of one route while a different route on the adjacent edge has a nearby-but-distinct stop.
+**200 m threshold** (not 100 m): suburban Pace routes have stops spaced 500 m–1 km apart; topo intersection nodes can be up to ~150 m from the nearest stop on dense city grids. 200 m provides enough slack while excluding clearly wrong matches. The same radius collects the candidate set; sets of neighboring nodes may overlap — harmless, since qualification only needs strict `stop_sequence` order between a from- and a to-occurrence.
 
-Log to stderr any resolution that uses the geographic fallback, and any that fail entirely (no stop within 200 m).
+Always validate station_id against `route_stops[route_id]` even when station_id is present — a node may carry the stop_id of one route while a different route on the adjacent edge has a nearby-but-distinct stop. A valid station_id does **not** short-circuit the geographic scan: its opposite-curb partner stop must still enter the set.
+
+Log to stderr any resolution where the station_id was missing/invalid (geographic fallback), and any that fail entirely (empty set).
 
 ### Step 7 — Compute headway for each route on each edge
 
@@ -318,18 +320,18 @@ For each edge, for each `line_entry` in `edge["properties"]["lines"]`:
 
 1. **Look up the route**: `route_id = line_entry["id"]` (a GTFS route_id after C++ Change 1). If it's not in `bus_route_ids` / has no active trips, treat as no_service. No label matching.
 
-2. **Resolve endpoint stops**: `from_stop = resolve_stop(from_node, route_id)`, `to_stop = resolve_stop(to_node, route_id)`.
+2. **Resolve endpoint candidate sets**: `from_stops = resolve_stops(from_node, route_id)`, `to_stops = resolve_stops(to_node, route_id)`.
 
 3. **Qualify trips by observed stop order** — do **not** use GTFS `direction_id`: it is an arbitrary per-route flag with no relationship to LOOM's edge orientation (edge `from`/`to` assignment comes out of graph construction and topo contractions). Instead, classify each trip by the order in which it actually visits the two stops:
 
-   **Normal case** (`from_stop` and `to_stop` both resolved and distinct): for each `trip_id` in `route_trips[route_id]`, look up both stops in `trip_stops[trip_id]`.
-   - The trip qualifies in the **forward group** if any occurrence of `from_stop` has a lower `stop_sequence` than some occurrence of `to_stop`. Its segment-entry departure time is the `dep_sec` of the *earliest* `from_stop` occurrence that precedes a `to_stop` occurrence.
-   - Symmetrically for the **reverse group** (`to_stop` before `from_stop`), with the entry departure at the `to_stop` occurrence.
-   - A loop trip may legitimately qualify in both groups (it traverses the segment in both directions); count it in both.
+   **Normal case** (`from_stops` and `to_stops` both non-empty and distinct sets): for each `trip_id` in `route_trips[route_id]`, merge the trip's occurrence lists of all stops in each set into one sequence-sorted list per side.
+   - The trip qualifies in the **forward group** if any occurrence of a from-candidate has a strictly lower `stop_sequence` than some occurrence of a to-candidate. Its segment-entry departure time is the `dep_sec` of the *earliest* qualifying from-occurrence.
+   - Symmetrically for the **reverse group** (a to-candidate before a from-candidate), with the entry departure at the earliest qualifying to-occurrence.
+   - A loop trip may legitimately qualify in both groups (it traverses the segment in both directions); count it in both. Overlapping candidate sets cannot self-qualify a single-stop trip because the order test is strict.
 
-   **Degenerate case** (`from_stop == to_stop`, or exactly one endpoint resolved): fall back to **presence-only qualification** — every trip serving the resolved stop qualifies, in a single group, with its departure at that stop. (GTFS stop_ids are usually direction-specific — one per side of the street — so this approximates a single direction.) Log each degenerate edge to stderr.
+   **Degenerate case** (`from_stops == to_stops`, or exactly one set non-empty): fall back to **presence-only qualification** — every trip serving any stop in the union of the sets qualifies, in a single group, with its departure at its earliest such occurrence. Log each degenerate edge to stderr.
 
-   **Neither endpoint resolved**: assign the `no_service` bucket and log a warning.
+   **Both sets empty**: assign the `no_service` bucket and log a warning.
 
 4. **Apply time window filter**: keep entry departures with `window_start <= dep_sec < window_end`.
 

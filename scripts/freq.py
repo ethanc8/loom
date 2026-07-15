@@ -62,6 +62,13 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _norm_color(c):
+    # LOOM expects bare hex ("d32f2f"); tolerate a leading '#' in the config.
+    if c is None:
+        return None
+    return c.lstrip("#")
+
+
 class Config:
     def __init__(self, path):
         with open(path, "rb") as f:
@@ -86,13 +93,14 @@ class Config:
         for b in cfg["buckets"]:
             mh = b["max_headway_min"]
             mh = math.inf if mh == "inf" else float(mh)
-            self.buckets.append((mh, b.get("color")))
+            self.buckets.append((mh, _norm_color(b.get("color"))))
         if not any(mh == math.inf for mh, _ in self.buckets):
             log("freq.py: warning: no catch-all bucket "
                 "(max_headway_min = \"inf\"); long headways will fall into "
                 "the no_service bucket")
 
-        self.no_service_color = cfg.get("no_service", {}).get("color")
+        self.no_service_color = _norm_color(
+            cfg.get("no_service", {}).get("color"))
 
     def bucket_for(self, headway_min):
         for i, (mh, _) in enumerate(self.buckets):
@@ -249,39 +257,45 @@ class FreqAnalyzer:
         self.n_degenerate = 0
         self.route_qualified = {}  # route_id -> set of trip_ids
 
-    def resolve_stop(self, node, route_id):
-        """stop_id of `node` on `route_id`, or None. Memoized."""
+    def resolve_stops(self, node, route_id):
+        """Candidate stop_ids of `node` on `route_id` as a (possibly empty)
+        frozenset: the node's station_id if it belongs to the route, plus
+        every stop of the route within FALLBACK_MAX_DIST_M. A set, not a
+        single stop: the two directions of a street use distinct GTFS stops
+        a few metres apart, and a topo node stands for the whole street
+        corner — resolving to one curb arbitrarily means no single trip
+        visits both endpoints of an edge whose nodes picked opposite curbs.
+        Memoized."""
         node_id = node["properties"].get("id")
         key = (node_id, route_id)
         if key in self._resolve_memo:
             return self._resolve_memo[key]
 
         stops_of_route = self.route_stops.get(route_id, {})
+        cands = set()
 
         sid = node["properties"].get("station_id", "")
         if sid and sid in stops_of_route:
-            self._resolve_memo[key] = sid
-            return sid
+            cands.add(sid)
 
-        # geographic fallback: nearest stop of this route within 200 m
         lon, lat = node["geometry"]["coordinates"]
-        best, best_d = None, FALLBACK_MAX_DIST_M
         for cand, (clat, clon) in stops_of_route.items():
-            d = haversine_m(lat, lon, clat, clon)
-            if d < best_d:
-                best, best_d = cand, d
+            if haversine_m(lat, lon, clat, clon) < FALLBACK_MAX_DIST_M:
+                cands.add(cand)
 
-        if best is not None:
-            self.n_fallback += 1
-            log(f"freq.py: node {node_id} (station_id '{sid}') resolved "
-                f"geographically to stop {best} ({best_d:.0f} m) for route "
-                f"{route_id}")
-        else:
+        if not cands:
             self.n_unresolved += 1
             log(f"freq.py: node {node_id} (station_id '{sid}'): no stop of "
                 f"route {route_id} within {FALLBACK_MAX_DIST_M:.0f} m")
-        self._resolve_memo[key] = best
-        return best
+        elif not (sid and sid in stops_of_route):
+            self.n_fallback += 1
+            log(f"freq.py: node {node_id} (station_id '{sid}') resolved "
+                f"geographically to {len(cands)} stop(s) of route "
+                f"{route_id}")
+
+        res = frozenset(cands)
+        self._resolve_memo[key] = res
+        return res
 
     def _mark_qualified(self, route_id, trip_id):
         self.route_qualified.setdefault(route_id, set()).add(trip_id)
@@ -302,31 +316,32 @@ class FreqAnalyzer:
             return (sum(gaps) / len(gaps)) / 60.0
         return statistics.median(gaps) / 60.0
 
-    def headway(self, route_id, from_stop, to_stop):
-        """Headway in minutes for a route between two resolved stops
-        (either possibly None), or None for no service in the window."""
-        key = (route_id, from_stop, to_stop)
+    def headway(self, route_id, from_stops, to_stops):
+        """Headway in minutes for a route between two resolved candidate
+        stop sets (either possibly empty), or None for no service in the
+        window."""
+        key = (route_id, from_stops, to_stops)
         if key in self._headway_memo:
             return self._headway_memo[key]
 
         fwd, rev = [], []
-        degenerate = from_stop == to_stop or from_stop is None \
-            or to_stop is None
-        anchor = from_stop if from_stop is not None else to_stop
+        degenerate = from_stops == to_stops or not from_stops \
+            or not to_stops
+        anchor = from_stops | to_stops
 
         for tid in self.route_trips.get(route_id, ()):
             ts = self.trip_stops.get(tid)
             if ts is None:
                 continue
             if degenerate:
-                # presence-only: every trip serving the stop qualifies
-                occs = ts.get(anchor)
+                # presence-only: every trip serving any candidate qualifies
+                occs = sorted(o for s in anchor for o in ts.get(s, ()))
                 if occs:
                     fwd.append(occs[0][1])
                     self._mark_qualified(route_id, tid)
                 continue
-            fr = ts.get(from_stop)
-            to = ts.get(to_stop)
+            fr = sorted(o for s in from_stops for o in ts.get(s, ()))
+            to = sorted(o for s in to_stops for o in ts.get(s, ()))
             if not fr or not to:
                 continue
             # trip qualifies forward if some from-occurrence precedes some
@@ -356,22 +371,24 @@ class FreqAnalyzer:
         props = edge["properties"]
         from_node = node_map.get(props.get("from"))
         to_node = node_map.get(props.get("to"))
-        from_stop = (self.resolve_stop(from_node, route_id)
-                     if from_node else None)
-        to_stop = self.resolve_stop(to_node, route_id) if to_node else None
+        from_stops = (self.resolve_stops(from_node, route_id)
+                      if from_node else frozenset())
+        to_stops = (self.resolve_stops(to_node, route_id)
+                    if to_node else frozenset())
 
-        if from_stop is None and to_stop is None:
+        if not from_stops and not to_stops:
             log(f"freq.py: edge {props.get('id')}: neither endpoint resolved "
                 f"for route {route_id}; assigning no_service")
             return NO_SERVICE, None
 
-        if from_stop == to_stop or from_stop is None or to_stop is None:
+        if from_stops == to_stops or not from_stops or not to_stops:
             self.n_degenerate += 1
             log(f"freq.py: edge {props.get('id')}: degenerate endpoints for "
-                f"route {route_id} (from={from_stop}, to={to_stop}); using "
-                "presence-only qualification")
+                f"route {route_id} ({len(from_stops)} from-candidates, "
+                f"{len(to_stops)} to-candidates); using presence-only "
+                "qualification")
 
-        h = self.headway(route_id, from_stop, to_stop)
+        h = self.headway(route_id, from_stops, to_stops)
         if h is None:
             return NO_SERVICE, None
         return self.cfg.bucket_for(h), h
