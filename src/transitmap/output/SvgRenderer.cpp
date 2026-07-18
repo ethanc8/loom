@@ -906,9 +906,12 @@ void SvgRenderer::renderLineLabels(const Labeller& labeller,
                             {"startOffset", "50%"}});
 
     double dy = 0;
-    for (auto line : label.lines) {
+    for (size_t i = 0; i < label.lines.size(); i++) {
+      auto line = label.lines[i];
+      const std::string& color =
+          i < label.colors.size() ? label.colors[i] : line->color();
       _w.openTag("tspan",
-                 {{"fill", "#" + line->color()}, {"dx", util::toString(dy)}});
+                 {{"fill", "#" + color}, {"dx", util::toString(dy)}});
       dy = (label.fontSize * _cfg->outputResolution) / 3;
       _w.writeText(line->label());
       _w.closeTag();

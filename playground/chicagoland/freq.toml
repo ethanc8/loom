@@ -8,10 +8,28 @@ end_time   = "14:00"   # e.g. a late-evening window may be "22:00" - "26:00".
 
 [metric]
 # How to aggregate inter-trip gaps within the window.
-# "max"    - longest gap (worst-case wait)
-# "mean"   - arithmetic mean of all gaps
-# "median" - 50th-percentile gap (robust to outliers)
-type = "median"
+# "max"       - longest gap (worst-case wait; one odd gap reclassifies the
+#               span it falls in)
+# "mean"      - arithmetic mean of all gaps
+# "median"    - 50th-percentile gap (robust to outliers)
+# "count"     - window duration / number of trips ("buses per hour";
+#               most stable, ignores spacing entirely)
+# "effective" - sum(g^2)/sum(g): average headway experienced by a randomly
+#               arriving rider; equals the plain headway for even service,
+#               degrades smoothly with bunching. Recommended.
+type = "effective"
+
+# Optional polish pass over each route's stop-to-stop spans.
+# Remove the section (or set enabled = false) to disable.
+[smoothing]
+enabled = true
+# Collapse a run of equal-bucket spans shorter than this (metres) when the
+# runs on both sides agree with each other. Genuine changes (branch points,
+# short turns) form long runs and survive.
+min_run_m = 400
+# Spans with no resolvable boundary stop on either end inherit a neighbor's
+# bucket (the slower one if neighbors disagree) instead of no_service.
+fill_unknown = true
 
 # Frequency buckets, evaluated in order (smallest max_headway_min first).
 # The first bucket where max_headway_min >= computed headway is used.

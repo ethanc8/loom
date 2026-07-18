@@ -23,6 +23,10 @@ struct LineLabel {
   double fontSize;
 
   std::vector<const shared::linegraph::Line*> lines;
+
+  // effective color per line on the edge this label was placed on
+  // (freq_color override if present, else the line color)
+  std::vector<std::string> colors;
 };
 
 inline bool operator<(const LineLabel& a, const LineLabel& b) {

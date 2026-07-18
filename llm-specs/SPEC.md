@@ -63,10 +63,29 @@ end_time   = "14:00"   # e.g. a late-evening window may be "22:00" – "26:00".
 
 [metric]
 # How to aggregate inter-trip gaps within the window.
-# "max"    – longest gap (worst-case wait)
-# "mean"   – arithmetic mean of all gaps
-# "median" – 50th-percentile gap (robust to outliers)
-type = "max"
+# "max"       – longest gap (worst-case wait; hair-trigger: one odd gap
+#               reclassifies the span it falls in)
+# "mean"      – arithmetic mean of all gaps
+# "median"    – 50th-percentile gap (robust to outliers)
+# "count"     – window duration / number of trips ("buses per hour";
+#               most stable, ignores spacing entirely)
+# "effective" – sum(g²)/sum(g): the average headway experienced by a
+#               randomly arriving rider. Equals the plain headway for even
+#               service and degrades smoothly with bunching — recommended.
+type = "effective"
+
+# Optional polish pass over each route's span sequence (see Step 7b).
+# Disabled when the section is absent or enabled = false.
+[smoothing]
+enabled = true
+# A run of equal-bucket spans shorter than this is collapsed into the
+# surrounding bucket when the runs on both sides agree with each other.
+# Genuine changes (branch points, short turns) form long runs and survive.
+min_run_m = 400
+# Spans with no resolvable boundary stop on either end (rare: connector
+# spans between two branch nodes) inherit a neighbor's bucket — the slower
+# one if neighbors disagree — instead of falling to no_service.
+fill_unknown = true
 
 # Frequency buckets, evaluated in order (smallest max_headway_min first).
 # The first bucket where max_headway_min >= computed headway is used.
@@ -306,56 +325,52 @@ def resolve_stops(node, route_id) -> frozenset:
 
 Always validate station_id against `route_stops[route_id]` even when station_id is present — a node may carry the stop_id of one route while a different route on the adjacent edge has a nearby-but-distinct stop. A valid station_id does **not** short-circuit the geographic scan: its opposite-curb partner stop must still enter the set.
 
-Log to stderr any resolution where the station_id was missing/invalid (geographic fallback), and any that fail entirely (empty set).
+Resolution itself is silent (an empty set is *normal* for interior nodes a route passes without stopping); problems are logged at span level in Step 7.
 
-### Step 7 — Compute headway for each route on each edge
+### Step 7 — Walk each route into stop-to-stop spans; compute headway per span
 
-```python
-window_start = parse_time(config.window.start_time)
-window_end   = parse_time(config.window.end_time)
-window_dur_min = (window_end - window_start) / 60.0
-```
+**Classification is per span, not per graph edge.** Topo nodes are an implementation detail of the graph: they appear at junctions with other routes and at other routes' stops. From the viewer's perspective a route's color must only be able to change at *its own* stops (or where its variants diverge). Coloring individual edges instead produces flapping at invisible junction nodes and false no_service on express corridors whose interior nodes resolve to nothing.
 
-For each edge, for each `line_entry` in `edge["properties"]["lines"]`:
+**7a.1 — Build spans.** Group all line entries by `route_id` (a GTFS route_id after C++ Change 1; routes not in `bus_route_ids` or without active trips get no_service wholesale). For each route, collect its edges and walk them into maximal runs bounded by:
+- nodes whose candidate set for this route is **non-empty** (the route stops there),
+- **branch nodes** of the route's own subgraph (degree ≠ 2 over the route's edges — variants diverge, so frequency may genuinely change),
+- self-loop edges and graph boundaries.
 
-1. **Look up the route**: `route_id = line_entry["id"]` (a GTFS route_id after C++ Change 1). If it's not in `bus_route_ids` / has no active trips, treat as no_service. No label matching.
+Interior nodes (empty candidate set, degree 2) are walked through. Each span records its edges, its two boundary node ids, and its geometric length in metres (for smoothing).
 
-2. **Resolve endpoint candidate sets**: `from_stops = resolve_stops(from_node, route_id)`, `to_stops = resolve_stops(to_node, route_id)`.
+**7a.2 — Qualify trips per span.** With `from_stops` / `to_stops` = the boundary nodes' candidate sets:
 
-3. **Qualify trips by observed stop order** — do **not** use GTFS `direction_id`: it is an arbitrary per-route flag with no relationship to LOOM's edge orientation (edge `from`/`to` assignment comes out of graph construction and topo contractions). Instead, classify each trip by the order in which it actually visits the two stops:
+   **Normal case** (both non-empty, distinct): a trip qualifies if it visits at least one from-candidate **and** one to-candidate as *distinct* stop occurrences (a single visit to a stop the two sets share does not count). Its span-entry departure is the `dep_sec` of its earliest qualifying occurrence.
 
-   **Normal case** (`from_stops` and `to_stops` both non-empty and distinct sets): for each `trip_id` in `route_trips[route_id]`, merge the trip's occurrence lists of all stops in each set into one sequence-sorted list per side.
-   - The trip qualifies in the **forward group** if any occurrence of a from-candidate has a strictly lower `stop_sequence` than some occurrence of a to-candidate. Its segment-entry departure time is the `dep_sec` of the *earliest* qualifying from-occurrence.
-   - Symmetrically for the **reverse group** (a to-candidate before a from-candidate), with the entry departure at the earliest qualifying to-occurrence.
-   - A loop trip may legitimately qualify in both groups (it traverses the segment in both directions); count it in both. Overlapping candidate sets cannot self-qualify a single-stop trip because the order test is strict.
+   **Degenerate case** (`from_stops == to_stops`, or exactly one set non-empty): presence-only — every trip serving any stop in the union qualifies, with its departure at its earliest such occurrence. Count degenerate spans in the summary.
 
-   **Degenerate case** (`from_stops == to_stops`, or exactly one set non-empty): fall back to **presence-only qualification** — every trip serving any stop in the union of the sets qualifies, in a single group, with its departure at its earliest such occurrence. Log each degenerate edge to stderr.
+   **Both sets empty**: mark the span **unknown** and log it. Unknown spans fall to no_service unless smoothing's `fill_unknown` is on (Step 7b).
 
-   **Both sets empty**: assign the `no_service` bucket and log a warning.
+**7a.3 — Group departures by `direction_id`.** Trips lacking a `direction_id` fall back to observed stop order (forward if a from-occurrence precedes the last to-occurrence, else reverse; degenerate spans use a single group). Note the change from earlier revisions: `direction_id` is still never mapped to edge orientation — it is used *only* to partition trips into consistent groups, and the min over groups is taken regardless. Observed-order grouping alone breaks down when the candidate sets overlap (short spans): one-way trips then pass the strict order test in *both* directions, interleaving the two directions' departures in each group and roughly halving the computed headway.
 
-4. **Apply time window filter**: keep entry departures with `window_start <= dep_sec < window_end`.
-
-5. **Compute gaps and apply metric** (per group independently):
-   - Sort departure seconds; `gaps = [t[i+1] - t[i] for i in range(len(t)-1)]`
+**7a.4 — Window filter and metric** (per group independently):
+   - Keep entry departures with `window_start <= dep_sec < window_end`; sort; `gaps = [t[i+1] - t[i]]`
    - 0 trips in window → group has no headway
-   - 1 trip in window → 0 gaps; use `window_dur_min` as the headway (conservative)
-   - 2+ trips → apply `mean`, `median`, or `max` over gaps, convert to minutes
+   - `count` metric: `window_dur_min / n_trips` (no gaps needed)
+   - otherwise 1 trip in window → use `window_dur_min` as the headway (conservative)
+   - otherwise apply `max`, `mean`, `median`, or `effective` = `sum(g²)/sum(g)` (also used when all departures coincide: fall back to `window_dur_min`)
 
-6. **Take the minimum headway across groups** (best available service in either direction on this corridor). If no group has any trips → `no_service` bucket.
+**7a.5 — Take the minimum across groups**; no groups → no_service. **Assign the bucket** (first `[[buckets]]` entry with `max_headway_min >= headway_min`) to **every edge of the span**.
 
-7. **Assign bucket**: walk `[[buckets]]` in config order; use the first where `max_headway_min >= headway_min`.
+### Step 7b — Optional smoothing (config `[smoothing]`)
 
-After processing all edges:
+Runs per route over its span sequence; span adjacency crosses only boundary nodes shared by exactly two spans of the route, so branch points always break runs.
 
-8. **Determine per-route global color** (used for the shared `Line` object; appears in SVG/MVT junction arcs): for each route_id, take the **minimum computed headway** across all its segments, look up that bucket's color, and set `line_entry["color"]` to it on **all** edges of the route (it must be consistent, since only the first occurrence is read by `extractLine`).
+1. **fill_unknown**: unknown spans inherit a neighboring span's bucket across *any* shared boundary node (unknown spans typically sit between branch nodes); if neighbors disagree, take the slower bucket. Iterate to a fixpoint; leftovers fall to no_service.
+2. **Collapse short runs**: partition spans into maximal runs of equal bucket; a run shorter than `min_run_m` with at least two adjacent runs that all agree on one bucket is reassigned to that bucket. Iterate to a fixpoint (merges can cascade).
 
-9. **Set `freq_color`** on each line entry to the bucket color for that specific segment. May differ from `color` only at infrequent outer segments.
+After processing all routes:
 
-10. **Invisible routes**: if a line entry's bucket has no `color`, remove the entry. If an edge's `lines` array becomes empty, remove the edge feature.
+**Per-route global color** (used for the shared `Line` object): the best (lowest-index) *final* bucket over all the route's spans, set as `line_entry["color"]` on **all** edges of the route (it must be consistent, since only the first occurrence is read by `extractLine`). **`freq_color`** = the span's bucket color per entry. **Invisible buckets**: entries whose bucket has no `color` are removed; edges whose `lines` array becomes empty are removed.
 
-### Known limitation: express / limited-stop undercount
+### Known limitation: mixed local/skip-stop patterns under one route_id
 
-A trip only qualifies on a segment if it serves **both** endpoint stops. CTA X-routes and Pace express patterns running under the same route_id as the local skip stops, so they traverse segments without qualifying, making the computed headway look worse than reality. Not solved in v1 (bracketing logic is complex). **Required mitigation**: track, per route, the set of active trips that qualified on at least one edge; report `active − qualified` counts to stderr so the amount of dropped service is visible.
+A trip only qualifies on a span if it serves a boundary stop on each side. When a single route_id mixes local and skip-stop *patterns*, a skip-stop trip serving neither boundary of a local-only span doesn't count there, undercounting the headway. (Express routes with their own route_id are fine: their spans run between their own stops.) **Required mitigation**: track, per route, the set of active trips that qualified on at least one span; report `active − qualified` counts to stderr so the amount of dropped service is visible.
 
 ### Step 8 — Output and cleanup
 
@@ -375,9 +390,12 @@ Bucket ≤10 min:    234 route-segments
 Bucket ≤15 min:    891 route-segments
 ...
 No service bucket: 47 route-segments
-Geographic fallback used: 1823 node-endpoint resolutions
-Degenerate (same-stop/one-stop) edges: 96
-Unresolvable endpoints: 12
+Spans: 23123 across 259 routes
+Span boundaries resolved geographically (invalid/missing station_id): 5685
+Span boundaries with no stop within 200 m: 533
+Degenerate (equal/one-sided boundary) spans: 96
+Spans with no resolvable boundary at all: 12
+Smoothing: filled 12 unknown spans (0 left as no_service), collapsed 179 short runs (212 spans)
 Route cta_X9: 41 active trips, 39 qualified somewhere, 2 never qualified
 ```
 
@@ -424,8 +442,11 @@ The C++ renderer change reads `freq_color` for actual rendering and uses `color`
 | SVG junction arcs | `freq_color` of both adjacent segments; linear gradient between them when they differ |
 | MVT edge features | `freq_color` (per-segment, correct) |
 | MVT junction features | `freq_color` of both adjacent segments; arc split at midpoint when they differ |
+| SVG line labels (`-l`) | effective color of the edge the label is placed on (`freq_color` override if present, else line color) — a route's labels differ along its length |
 
 The global `color` (route's best-frequency bucket) is only a fallback for line entries without a `freq_color` override.
+
+With span-based classification a route's `freq_color` can only change at its own stops or branch points, so junction-arc gradients and MVT midpoint splits occur (mostly) under station geometry; the exposed round line-end caps at nodes are invisible whenever both sides share a color.
 
 ---
 

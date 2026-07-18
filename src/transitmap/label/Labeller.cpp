@@ -242,8 +242,11 @@ void Labeller::labelLines(const RenderGraph& g) {
                        &lineLabelNeighs);
 
           std::vector<const shared::linegraph::Line*> lines;
+          std::vector<std::string> colors;
           for (auto lo : e->pl().getLines()) {
             lines.push_back(lo.line);
+            colors.push_back(lo.colorOverride.empty() ? lo.line->color()
+                                                      : lo.colorOverride);
           }
 
           for (auto neighLabelId : lineLabelNeighs) {
@@ -258,7 +261,7 @@ void Labeller::labelLines(const RenderGraph& g) {
 
           if (!block)
             cands.push_back({cand, fabs((geomLen / 2) - (start + (labelW / 2))),
-                             fontSize, lines});
+                             fontSize, lines, colors});
           start += step;
         }
       }

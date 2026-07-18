@@ -2,9 +2,20 @@
 """freq.py — per-segment frequency coloring for the LOOM pipeline.
 
 Reads a topo (or loom) GeoJSON graph, computes each route's service headway
-on each edge within a configured time window from GTFS, assigns every
-(edge, route) pair a frequency bucket, and writes the modified GeoJSON to
-stdout. On every line entry it sets:
+per stop-to-stop span within a configured time window from GTFS, assigns
+every (edge, route) pair a frequency bucket, and writes the modified GeoJSON
+to stdout.
+
+Classification is per SPAN, not per graph edge: for each route, its edges
+are walked into maximal runs bounded by nodes that resolve to stops of that
+route (or by branch nodes of the route's subgraph). All edges of a span get
+the span's bucket, so a route's color can only change at its own stops or
+where variants diverge — never at other routes' stops or junction nodes,
+which are implementation details of the graph. Departures are grouped by
+GTFS direction_id (observed stop order for trips without one) and the
+headway is the min over groups.
+
+On every line entry it sets:
 
   color       the route's global color: the bucket of its best (minimum)
               headway over all segments. Must be identical on all edges,
@@ -32,6 +43,7 @@ from datetime import date as _date, datetime
 import pandas as pd
 
 NO_SERVICE = -1  # sentinel bucket index
+UNKNOWN = -2     # span with no resolvable boundary stop on either end
 
 FALLBACK_MAX_DIST_M = 200.0
 
@@ -85,8 +97,13 @@ class Config:
             sys.exit("freq.py: end_time must be after start_time")
 
         self.metric = cfg.get("metric", {}).get("type", "max")
-        if self.metric not in ("max", "mean", "median"):
+        if self.metric not in ("max", "mean", "median", "count", "effective"):
             sys.exit(f"freq.py: unknown metric type '{self.metric}'")
+
+        sm = cfg.get("smoothing", {})
+        self.smoothing_enabled = bool(sm.get("enabled", False))
+        self.smoothing_min_run_m = float(sm.get("min_run_m", 400.0))
+        self.smoothing_fill_unknown = bool(sm.get("fill_unknown", True))
 
         # [(max_headway_min, color-or-None), ...] in config order
         self.buckets = []
@@ -168,7 +185,8 @@ def load_gtfs(gtfs_dir, cfg):
                              ["route_id", "route_type"],
                              ["route_short_name"])
     trips = read_gtfs_table(gtfs_dir, "trips.txt",
-                            ["trip_id", "route_id", "service_id"])
+                            ["trip_id", "route_id", "service_id"],
+                            ["direction_id"])
     stops = read_gtfs_table(gtfs_dir, "stops.txt",
                             ["stop_id", "stop_lat", "stop_lon"])
     st = read_gtfs_table(
@@ -237,24 +255,34 @@ def load_gtfs(gtfs_dir, cfg):
 
     bus_route_ids = set(routes.loc[routes["route_type"] == "3", "route_id"])
 
-    return trip_stops, route_stops, route_trips, bus_route_ids
+    # {trip_id: direction_id} where present; used to group departures by
+    # travel direction (grouping only — never mapped to edge orientation)
+    trip_dir = {}
+    if "direction_id" in trips.columns:
+        for tid, d in zip(trips["trip_id"].values,
+                          trips["direction_id"].values):
+            if isinstance(d, str) and d != "":
+                trip_dir[tid] = d
+    if not trip_dir:
+        log("freq.py: trips.txt has no usable direction_id; grouping "
+            "departures by observed stop order instead")
+
+    return trip_stops, route_stops, route_trips, bus_route_ids, trip_dir
 
 
 class FreqAnalyzer:
     def __init__(self, cfg, trip_stops, route_stops, route_trips,
-                 bus_route_ids):
+                 bus_route_ids, trip_dir):
         self.cfg = cfg
         self.trip_stops = trip_stops
         self.route_stops = route_stops
         self.route_trips = route_trips
         self.bus_route_ids = bus_route_ids
+        self.trip_dir = trip_dir
 
         self._resolve_memo = {}
         self._headway_memo = {}
 
-        self.n_fallback = 0
-        self.n_unresolved = 0
-        self.n_degenerate = 0
         self.route_qualified = {}  # route_id -> set of trip_ids
 
     def resolve_stops(self, node, route_id):
@@ -264,8 +292,8 @@ class FreqAnalyzer:
         single stop: the two directions of a street use distinct GTFS stops
         a few metres apart, and a topo node stands for the whole street
         corner — resolving to one curb arbitrarily means no single trip
-        visits both endpoints of an edge whose nodes picked opposite curbs.
-        Memoized."""
+        visits both stops. An empty set is normal for interior nodes the
+        route passes without stopping. Memoized."""
         node_id = node["properties"].get("id")
         key = (node_id, route_id)
         if key in self._resolve_memo:
@@ -283,16 +311,6 @@ class FreqAnalyzer:
             if haversine_m(lat, lon, clat, clon) < FALLBACK_MAX_DIST_M:
                 cands.add(cand)
 
-        if not cands:
-            self.n_unresolved += 1
-            log(f"freq.py: node {node_id} (station_id '{sid}'): no stop of "
-                f"route {route_id} within {FALLBACK_MAX_DIST_M:.0f} m")
-        elif not (sid and sid in stops_of_route):
-            self.n_fallback += 1
-            log(f"freq.py: node {node_id} (station_id '{sid}') resolved "
-                f"geographically to {len(cands)} stop(s) of route "
-                f"{route_id}")
-
         res = frozenset(cands)
         self._resolve_memo[key] = res
         return res
@@ -307,91 +325,232 @@ class FreqAnalyzer:
                       if cfg.window_start <= d < cfg.window_end)
         if not deps:
             return None
+        window_min = (cfg.window_end - cfg.window_start) / 60.0
+        if cfg.metric == "count":
+            # trips per window, expressed as an average headway; ignores
+            # spacing entirely (a "buses per hour" measure)
+            return window_min / len(deps)
         if len(deps) == 1:
-            return (cfg.window_end - cfg.window_start) / 60.0
+            return window_min
         gaps = [b - a for a, b in zip(deps, deps[1:])]
         if cfg.metric == "max":
             return max(gaps) / 60.0
         if cfg.metric == "mean":
             return (sum(gaps) / len(gaps)) / 60.0
+        if cfg.metric == "effective":
+            # average headway experienced by a randomly arriving rider:
+            # sum(g^2)/sum(g); equals g for even service, degrades smoothly
+            # with bunching instead of max's single-outlier cliff
+            total = sum(gaps)
+            if total == 0:
+                return window_min
+            return (sum(g * g for g in gaps) / total) / 60.0
         return statistics.median(gaps) / 60.0
 
     def headway(self, route_id, from_stops, to_stops):
-        """Headway in minutes for a route between two resolved candidate
-        stop sets (either possibly empty), or None for no service in the
-        window."""
+        """Headway in minutes between two boundary candidate stop sets
+        (either possibly empty), or None for no service in the window.
+
+        A trip qualifies if it visits at least one from-candidate and one
+        to-candidate as distinct stop occurrences (presence-only at the
+        union if the sets are equal or one is empty). Its entry departure
+        is at its earliest qualifying occurrence. Departures are grouped
+        by direction_id — grouping only, never mapped to edge orientation,
+        since the min over groups is taken anyway — with observed stop
+        order as the per-trip fallback; headway is the min over groups."""
         key = (route_id, from_stops, to_stops)
         if key in self._headway_memo:
             return self._headway_memo[key]
 
-        fwd, rev = [], []
         degenerate = from_stops == to_stops or not from_stops \
             or not to_stops
         anchor = from_stops | to_stops
+        groups = {}
 
         for tid in self.route_trips.get(route_id, ()):
             ts = self.trip_stops.get(tid)
             if ts is None:
                 continue
+            gkey = self.trip_dir.get(tid)
             if degenerate:
-                # presence-only: every trip serving any candidate qualifies
                 occs = sorted(o for s in anchor for o in ts.get(s, ()))
-                if occs:
-                    fwd.append(occs[0][1])
-                    self._mark_qualified(route_id, tid)
-                continue
-            fr = sorted(o for s in from_stops for o in ts.get(s, ()))
-            to = sorted(o for s in to_stops for o in ts.get(s, ()))
-            if not fr or not to:
-                continue
-            # trip qualifies forward if some from-occurrence precedes some
-            # to-occurrence; entry departure at the earliest such occurrence
-            if fr[0][0] < to[-1][0]:
-                fwd.append(fr[0][1])
-                self._mark_qualified(route_id, tid)
-            if to[0][0] < fr[-1][0]:
-                rev.append(to[0][1])
-                self._mark_qualified(route_id, tid)
+                if not occs:
+                    continue
+                dep = occs[0][1]
+                if gkey is None:
+                    gkey = "_any"
+            else:
+                fr = sorted(o for s in from_stops for o in ts.get(s, ()))
+                to = sorted(o for s in to_stops for o in ts.get(s, ()))
+                if not fr or not to:
+                    continue
+                # reject a trip whose only qualifying pair is one identical
+                # visit to a stop the two sets share
+                if len(fr) == 1 and len(to) == 1 and fr[0] == to[0]:
+                    continue
+                dep = min(fr[0], to[0])[1]
+                if gkey is None:
+                    gkey = "_fwd" if fr[0][0] < to[-1][0] else "_rev"
+            groups.setdefault(gkey, []).append(dep)
+            self._mark_qualified(route_id, tid)
 
-        headways = [h for h in (self._group_headway_min(fwd),
-                                self._group_headway_min(rev))
-                    if h is not None]
-        res = min(headways) if headways else None
+        hs = [h for h in (self._group_headway_min(deps)
+                          for deps in groups.values())
+              if h is not None]
+        res = min(hs) if hs else None
         self._headway_memo[key] = res
         return res
 
-    def classify(self, edge, entry, node_map):
-        """Bucket index for one line entry on one edge; None headway maps
-        to NO_SERVICE. Returns (bucket_idx, headway_min_or_None)."""
-        route_id = entry["id"]
-        if route_id not in self.bus_route_ids \
-                or route_id not in self.route_trips:
-            return NO_SERVICE, None
 
-        props = edge["properties"]
-        from_node = node_map.get(props.get("from"))
-        to_node = node_map.get(props.get("to"))
-        from_stops = (self.resolve_stops(from_node, route_id)
-                      if from_node else frozenset())
-        to_stops = (self.resolve_stops(to_node, route_id)
-                    if to_node else frozenset())
+def geom_length_m(coords):
+    return sum(haversine_m(a[1], a[0], b[1], b[0])
+               for a, b in zip(coords, coords[1:]))
 
-        if not from_stops and not to_stops:
-            log(f"freq.py: edge {props.get('id')}: neither endpoint resolved "
-                f"for route {route_id}; assigning no_service")
-            return NO_SERVICE, None
 
-        if from_stops == to_stops or not from_stops or not to_stops:
-            self.n_degenerate += 1
-            log(f"freq.py: edge {props.get('id')}: degenerate endpoints for "
-                f"route {route_id} ({len(from_stops)} from-candidates, "
-                f"{len(to_stops)} to-candidates); using presence-only "
-                "qualification")
+def build_spans(route_id, items, node_map, az):
+    """Group a route's (edge, line_entry) items into stop-to-stop spans.
 
-        h = self.headway(route_id, from_stops, to_stops)
-        if h is None:
-            return NO_SERVICE, None
-        return self.cfg.bucket_for(h), h
+    A span is a maximal run of the route's edges bounded by nodes that
+    resolve to stops of the route, by branch nodes of the route's subgraph
+    (degree != 2), or by self-loop edges. Interior nodes — junctions and
+    other routes' stops — are walked through, so a route's bucket can only
+    change where it actually stops or where variants diverge.
+
+    Returns a list of dicts: {"items", "ends" (two node ids), "length_m"}.
+    """
+    adj = {}
+    for it in items:
+        p = it[0]["properties"]
+        for nid in (p.get("from"), p.get("to")):
+            adj.setdefault(nid, []).append(it)
+
+    def is_boundary(nid):
+        if nid is None or nid not in node_map:
+            return True
+        if len(adj.get(nid, ())) != 2:
+            return True
+        return bool(az.resolve_stops(node_map[nid], route_id))
+
+    spans, assigned = [], set()
+    for it in items:
+        if id(it[1]) in assigned:
+            continue
+        span_items = [it]
+        assigned.add(id(it[1]))
+        ends = []
+        for side in (0, 1):
+            p = it[0]["properties"]
+            nid = p.get("from") if side == 0 else p.get("to")
+            if p.get("from") == p.get("to"):  # self-loop edge
+                ends.append(nid)
+                continue
+            while not is_boundary(nid):
+                nxt = [x for x in adj[nid] if id(x[1]) not in assigned]
+                if not nxt:
+                    break  # closed ring: back at an already-assigned edge
+                x = nxt[0]
+                assigned.add(id(x[1]))
+                span_items.append(x)
+                q = x[0]["properties"]
+                if q.get("from") == q.get("to"):
+                    break
+                nid = q["to"] if q["from"] == nid else q["from"]
+            ends.append(nid)
+        length = sum(geom_length_m(e["geometry"]["coordinates"])
+                     for e, _ in span_items)
+        spans.append({"items": span_items, "ends": ends,
+                      "length_m": length})
+    return spans
+
+
+def smooth_route(spans, cfg, stats):
+    """Optional polish on one route's spans, in place.
+
+    1. fill_unknown: spans with no resolvable boundary on either end
+       inherit a neighbor's bucket (the slower one if neighbors disagree).
+    2. Runs of equal-bucket spans shorter than min_run_m are collapsed
+       into the surrounding bucket when the runs on both sides agree.
+    Neighbor relations only cross boundary nodes shared by exactly two
+    spans, so branch points always break runs.
+    """
+    node_spans = {}
+    for sp in spans:
+        for nid in sp["ends"]:
+            node_spans.setdefault(nid, []).append(sp)
+
+    def neighbors(sp):
+        res = []
+        for nid in sp["ends"]:
+            lst = node_spans.get(nid, ())
+            if len(lst) == 2:
+                other = lst[0] if lst[1] is sp else lst[1]
+                if other is not sp:
+                    res.append(other)
+        return res
+
+    def rank(b):  # slowness; no_service is slowest
+        return math.inf if b == NO_SERVICE else b
+
+    if cfg.smoothing_fill_unknown:
+        # unknown spans usually sit between branch nodes, so inherit across
+        # any shared end node, not just the degree-2 relation runs use
+        changed = True
+        while changed:
+            changed = False
+            for sp in spans:
+                if sp["bucket"] != UNKNOWN:
+                    continue
+                nb = [n["bucket"] for nid in sp["ends"]
+                      for n in node_spans.get(nid, ())
+                      if n is not sp and n["bucket"] != UNKNOWN]
+                if not nb:
+                    continue
+                sp["bucket"] = max(nb, key=rank)
+                stats["filled"] += 1
+                changed = True
+    for sp in spans:
+        if sp["bucket"] == UNKNOWN:
+            sp["bucket"] = NO_SERVICE
+            stats["unknown_left"] += 1
+
+    for _ in range(10):  # short runs can merge; iterate to a fixpoint
+        # partition into runs of equal-bucket spans
+        run_of = {}
+        runs = []
+        for sp in spans:
+            if id(sp) in run_of:
+                continue
+            run = [sp]
+            run_of[id(sp)] = run
+            queue = [sp]
+            while queue:
+                cur = queue.pop()
+                for n in neighbors(cur):
+                    if id(n) not in run_of and n["bucket"] == cur["bucket"]:
+                        run_of[id(n)] = run
+                        run.append(n)
+                        queue.append(n)
+            runs.append(run)
+
+        changed = False
+        for run in runs:
+            length = sum(sp["length_m"] for sp in run)
+            if length >= cfg.smoothing_min_run_m:
+                continue
+            nb_buckets = {n["bucket"] for sp in run for n in neighbors(sp)
+                          if run_of.get(id(n)) is not run}
+            n_nb = sum(1 for sp in run for n in neighbors(sp)
+                       if run_of.get(id(n)) is not run)
+            if n_nb >= 2 and len(nb_buckets) == 1:
+                new = nb_buckets.pop()
+                if new != run[0]["bucket"]:
+                    for sp in run:
+                        sp["bucket"] = new
+                    stats["collapsed_runs"] += 1
+                    stats["collapsed_spans"] += len(run)
+                    changed = True
+        if not changed:
+            break
 
 
 def main():
@@ -417,42 +576,95 @@ def main():
                 if f["geometry"]["type"] == "Point"}
     edges = [f for f in features if f["geometry"]["type"] == "LineString"]
 
-    trip_stops, route_stops, route_trips, bus_route_ids = \
+    trip_stops, route_stops, route_trips, bus_route_ids, trip_dir = \
         load_gtfs(args.gtfs, cfg)
     az = FreqAnalyzer(cfg, trip_stops, route_stops, route_trips,
-                      bus_route_ids)
+                      bus_route_ids, trip_dir)
 
-    # pass 1: bucket every (edge, line entry); track per-route best headway
-    assignments = []  # (edge, entry, bucket_idx) in edge order
-    route_best = {}   # route_id -> min headway over all its segments
-    bucket_counts = {}
+    # pass 1: group line entries by route, walk each route's edges into
+    # stop-to-stop spans, bucket per span
+    route_entries = {}
     for edge in edges:
         for entry in edge["properties"].get("lines", []):
-            idx, h = az.classify(edge, entry, node_map)
-            assignments.append((edge, entry, idx))
-            bucket_counts[idx] = bucket_counts.get(idx, 0) + 1
-            if h is not None:
-                rid = entry["id"]
-                if rid not in route_best or h < route_best[rid]:
-                    route_best[rid] = h
+            route_entries.setdefault(entry["id"], []).append((edge, entry))
+
+    entry_bucket = {}  # id(entry) -> final bucket idx
+    route_best = {}    # route_id -> best (lowest) final bucket idx
+    n_spans = n_degenerate = n_unknown = 0
+    end_stats = {}     # (node_id, route_id) -> "ok" | "fallback" | "none"
+    smooth_stats = {"filled": 0, "unknown_left": 0,
+                    "collapsed_runs": 0, "collapsed_spans": 0}
+
+    for rid, items in route_entries.items():
+        if rid not in bus_route_ids or rid not in route_trips:
+            for _, entry in items:
+                entry_bucket[id(entry)] = NO_SERVICE
+            continue
+        spans = build_spans(rid, items, node_map, az)
+        n_spans += len(spans)
+        for sp in spans:
+            sides = []
+            for nid in sp["ends"]:
+                node = node_map.get(nid)
+                cands = az.resolve_stops(node, rid) if node else frozenset()
+                sides.append(cands)
+                if node is not None:
+                    sid = node["properties"].get("station_id", "")
+                    end_stats[(nid, rid)] = (
+                        "none" if not cands
+                        else "ok" if sid in route_stops.get(rid, {})
+                        else "fallback")
+            fs, ts = sides
+            if not fs and not ts:
+                n_unknown += 1
+                log(f"freq.py: route {rid}: span of {len(sp['items'])} "
+                    "edge(s) has no resolvable boundary stop; "
+                    + ("deferring to smoothing"
+                       if cfg.smoothing_enabled and cfg.smoothing_fill_unknown
+                       else "assigning no_service"))
+                sp["bucket"] = UNKNOWN
+                continue
+            if fs == ts or not fs or not ts:
+                n_degenerate += 1
+            h = az.headway(rid, fs, ts)
+            sp["bucket"] = cfg.bucket_for(h) if h is not None else NO_SERVICE
+        if cfg.smoothing_enabled:
+            smooth_route(spans, cfg, smooth_stats)
+        else:
+            for sp in spans:
+                if sp["bucket"] == UNKNOWN:
+                    sp["bucket"] = NO_SERVICE
+        for sp in spans:
+            b = sp["bucket"]
+            for _, entry in sp["items"]:
+                entry_bucket[id(entry)] = b
+            if b != NO_SERVICE and (rid not in route_best
+                                    or b < route_best[rid]):
+                route_best[rid] = b
+
+    bucket_counts = {}
+    for b in entry_bucket.values():
+        bucket_counts[b] = bucket_counts.get(b, 0) + 1
 
     # pass 2: write colors / collect removals
     removed_entries = {}  # id(edge) -> set of entry ids to drop
-    for edge, entry, idx in assignments:
-        seg_color = cfg.bucket_color(idx)
-        if seg_color is None:
-            removed_entries.setdefault(id(edge), set()).add(id(entry))
-            continue
-        rid = entry["id"]
-        if rid in route_best:
-            global_color = cfg.bucket_color(cfg.bucket_for(route_best[rid]))
-        else:
-            global_color = cfg.no_service_color
-        # an invisible best bucket with a visible segment bucket is a
-        # pathological config; fall back to the segment color
-        entry["color"] = global_color if global_color is not None \
-            else seg_color
-        entry["freq_color"] = seg_color
+    for edge in edges:
+        for entry in edge["properties"].get("lines", []):
+            idx = entry_bucket[id(entry)]
+            seg_color = cfg.bucket_color(idx)
+            if seg_color is None:
+                removed_entries.setdefault(id(edge), set()).add(id(entry))
+                continue
+            rid = entry["id"]
+            if rid in route_best:
+                global_color = cfg.bucket_color(route_best[rid])
+            else:
+                global_color = cfg.no_service_color
+            # an invisible best bucket with a visible segment bucket is a
+            # pathological config; fall back to the segment color
+            entry["color"] = global_color if global_color is not None \
+                else seg_color
+            entry["freq_color"] = seg_color
 
     # cleanup: drop removed entries, empty edges, orphan nodes, stale refs
     kept_features = []
@@ -517,10 +729,20 @@ def main():
     vis = "" if cfg.no_service_color is not None else " (invisible)"
     log(f"No service bucket:{vis} "
         f"{bucket_counts.get(NO_SERVICE, 0)} route-segments")
-    log(f"Geographic fallback used: {az.n_fallback} node-endpoint "
-        "resolutions")
-    log(f"Degenerate (same-stop/one-stop) edges: {az.n_degenerate}")
-    log(f"Unresolvable endpoints: {az.n_unresolved}")
+    n_fallback = sum(1 for v in end_stats.values() if v == "fallback")
+    n_unresolved = sum(1 for v in end_stats.values() if v == "none")
+    log(f"Spans: {n_spans} across {len(route_entries)} routes")
+    log(f"Span boundaries resolved geographically (invalid/missing "
+        f"station_id): {n_fallback}")
+    log(f"Span boundaries with no stop within {FALLBACK_MAX_DIST_M:.0f} m: "
+        f"{n_unresolved}")
+    log(f"Degenerate (equal/one-sided boundary) spans: {n_degenerate}")
+    log(f"Spans with no resolvable boundary at all: {n_unknown}")
+    if cfg.smoothing_enabled:
+        log(f"Smoothing: filled {smooth_stats['filled']} unknown spans "
+            f"({smooth_stats['unknown_left']} left as no_service), "
+            f"collapsed {smooth_stats['collapsed_runs']} short runs "
+            f"({smooth_stats['collapsed_spans']} spans)")
     log(f"Removed: {n_removed_entries} line entries, {n_removed_edges} "
         f"edges, {n_removed_nodes} orphan nodes")
     for rid in sorted(route_trips):
