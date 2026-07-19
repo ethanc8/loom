@@ -7,12 +7,15 @@ every (edge, route) pair a frequency bucket, and writes the modified GeoJSON
 to stdout.
 
 Classification is per SPAN, not per graph edge: for each route, its edges
-are walked into maximal runs bounded by nodes that resolve to stops of that
-route (or by branch nodes of the route's subgraph). All edges of a span get
-the span's bucket, so a route's color can only change at its own stops or
-where variants diverge — never at other routes' stops or junction nodes,
-which are implementation details of the graph. Departures are grouped by
-GTFS direction_id (observed stop order for trips without one) and the
+are walked into maximal runs bounded by nodes that stand for stops of that
+route (strictly: valid station_id or nearest node to a stop) or by branch
+nodes of the route's subgraph. All edges of a span get the span's bucket,
+so a route's color can only change at its own stops or where variants
+diverge — never at other routes' stops or junction nodes, which are
+implementation details of the graph. A trip counts toward a span if it
+traverses it — it visits stops on both sides, where each side includes
+the neighboring stops just beyond the span's ends. Departures are grouped
+by GTFS direction_id (observed stop order for trips without one) and the
 headway is the min over groups.
 
 On every line entry it sets:
@@ -35,7 +38,6 @@ import argparse
 import json
 import math
 import os
-import statistics
 import sys
 import tomllib
 from datetime import date as _date, datetime
@@ -319,7 +321,12 @@ class FreqAnalyzer:
         self.route_qualified.setdefault(route_id, set()).add(trip_id)
 
     def _group_headway_min(self, deps):
-        """Headway in minutes from a group's entry departures, or None."""
+        """Headway in minutes from a group's entry departures, or None.
+
+        The window edges count as gaps — (first dep - window start) and
+        (window end - last dep) — so the gaps tile the whole window. A
+        couple of stray trips in an otherwise empty window then read as
+        the sparse service they are, not as their mutual spacing."""
         cfg = self.cfg
         deps = sorted(d for d in deps
                       if cfg.window_start <= d < cfg.window_end)
@@ -330,9 +337,9 @@ class FreqAnalyzer:
             # trips per window, expressed as an average headway; ignores
             # spacing entirely (a "buses per hour" measure)
             return window_min / len(deps)
-        if len(deps) == 1:
-            return window_min
-        gaps = [b - a for a, b in zip(deps, deps[1:])]
+        gaps = [deps[0] - cfg.window_start]
+        gaps.extend(b - a for a, b in zip(deps, deps[1:]))
+        gaps.append(cfg.window_end - deps[-1])
         if cfg.metric == "max":
             return max(gaps) / 60.0
         if cfg.metric == "mean":
@@ -341,11 +348,19 @@ class FreqAnalyzer:
             # average headway experienced by a randomly arriving rider:
             # sum(g^2)/sum(g); equals g for even service, degrades smoothly
             # with bunching instead of max's single-outlier cliff
-            total = sum(gaps)
-            if total == 0:
-                return window_min
+            total = sum(gaps)  # == the window length
             return (sum(g * g for g in gaps) / total) / 60.0
-        return statistics.median(gaps) / 60.0
+        # median: time-weighted — the gap in effect at the median minute
+        # of the window. A plain median of gaps would still read two
+        # bunched trips in an empty window as frequent service.
+        gaps.sort()
+        half = sum(gaps) / 2.0
+        acc = 0.0
+        for g in gaps:
+            acc += g
+            if acc >= half:
+                return g / 60.0
+        return window_min
 
     def headway(self, route_id, from_stops, to_stops):
         """Headway in minutes between two boundary candidate stop sets
@@ -411,12 +426,22 @@ def build_spans(route_id, items, node_map, az):
     """Group a route's (edge, line_entry) items into stop-to-stop spans.
 
     A span is a maximal run of the route's edges bounded by nodes that
-    resolve to stops of the route, by branch nodes of the route's subgraph
+    stand for stops of the route, by branch nodes of the route's subgraph
     (degree != 2), or by self-loop edges. Interior nodes — junctions and
     other routes' stops — are walked through, so a route's bucket can only
     change where it actually stops or where variants diverge.
 
-    Returns a list of dicts: {"items", "ends" (two node ids), "length_m"}.
+    The boundary test is strict: a node stands for a stop only if its
+    station_id belongs to the route, or it is the NEAREST of the route's
+    nodes to one of its stops (within FALLBACK_MAX_DIST_M). Being merely
+    within the fallback radius of some stop is not enough — in dense
+    networks nearly every junction node is, and using that as the boundary
+    test chops interstations into micro-spans whose jittery headways can
+    straddle a bucket edge mid-segment. The generous radius remains right
+    for qualification (see span_sides).
+
+    Returns a list of dicts: {"items", "ends" (two node ids), "sides"
+    (two frozensets of qualification stop_ids), "length_m"}.
     """
     adj = {}
     for it in items:
@@ -424,12 +449,44 @@ def build_spans(route_id, items, node_map, az):
         for nid in (p.get("from"), p.get("to")):
             adj.setdefault(nid, []).append(it)
 
+    stops_of_route = az.route_stops.get(route_id, {})
+
+    node_pos = {}
+    stop_nodes = set()
+    for nid in adj:
+        node = node_map.get(nid)
+        if node is None:
+            continue
+        lon, lat = node["geometry"]["coordinates"]
+        node_pos[nid] = (lat, lon)
+        sid = node["properties"].get("station_id", "")
+        if sid and sid in stops_of_route:
+            stop_nodes.add(nid)
+
+    cell = 0.003  # ~330 m grid for the nearest-node search
+    grid = {}
+    for nid, (lat, lon) in node_pos.items():
+        grid.setdefault((math.floor(lat / cell), math.floor(lon / cell)),
+                        []).append(nid)
+    for sid, (slat, slon) in stops_of_route.items():
+        ci, cj = math.floor(slat / cell), math.floor(slon / cell)
+        best, bd = None, FALLBACK_MAX_DIST_M
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for nid in grid.get((ci + di, cj + dj), ()):
+                    nlat, nlon = node_pos[nid]
+                    d = haversine_m(slat, slon, nlat, nlon)
+                    if d < bd:
+                        best, bd = nid, d
+        if best is not None:
+            stop_nodes.add(best)
+
     def is_boundary(nid):
         if nid is None or nid not in node_map:
             return True
         if len(adj.get(nid, ())) != 2:
             return True
-        return bool(az.resolve_stops(node_map[nid], route_id))
+        return nid in stop_nodes
 
     spans, assigned = [], set()
     for it in items:
@@ -460,7 +517,56 @@ def build_spans(route_id, items, node_map, az):
                      for e, _ in span_items)
         spans.append({"items": span_items, "ends": ends,
                       "length_m": length})
+    for sp in spans:
+        sp["sides"] = span_sides(route_id, sp, adj, node_map, az)
     return spans
+
+
+def span_sides(route_id, sp, adj, node_map, az):
+    """The two qualification stop sets of a span: each end's own candidates
+    plus, walking outward along the route's subgraph (away from the span,
+    down every branch, never through the span's other end), the first stop
+    cluster beyond it.
+
+    A trip visiting both sides has traversed the span. The plain per-node
+    candidate sets are not enough for that test: where the two directions
+    stop at different curbs or offset locations, each end resolves to one
+    direction's stop only and no single trip visits both ("Sibley &
+    Greenwood Rd" eastbound vs "Sibley & Greenwood Ave" westbound); and a
+    median split or expressway ramp bounds spans with stop-less branch
+    nodes that resolve to nothing at all. Walking out to the neighboring
+    stops makes both cases qualify exactly the trips that ride across.
+    Trips that terminate at a boundary stop still fail the far side."""
+    span_ids = {id(it[1]) for it in sp["items"]}
+    ends = sp["ends"]
+    sides = []
+    for i, end in enumerate(ends):
+        other = ends[1 - i] if ends[0] != ends[1] else None
+        node = node_map.get(end)
+        base = az.resolve_stops(node, route_id) if node else frozenset()
+        collected = set(base)
+        seen = {end}
+        queue = [end]
+        while queue:
+            nid = queue.pop()
+            for it in adj.get(nid, ()):
+                if id(it[1]) in span_ids:
+                    continue
+                p = it[0]["properties"]
+                nxt = p["to"] if p["from"] == nid else p["from"]
+                if nxt in seen or nxt == other:
+                    continue
+                seen.add(nxt)
+                nnode = node_map.get(nxt)
+                if nnode is None:
+                    continue
+                cands = az.resolve_stops(nnode, route_id)
+                if cands - base:
+                    collected |= cands  # next stop cluster; end this path
+                else:
+                    queue.append(nxt)
+        sides.append(frozenset(collected))
+    return sides
 
 
 def smooth_route(spans, cfg, stats):
@@ -603,22 +709,21 @@ def main():
         spans = build_spans(rid, items, node_map, az)
         n_spans += len(spans)
         for sp in spans:
-            sides = []
             for nid in sp["ends"]:
                 node = node_map.get(nid)
-                cands = az.resolve_stops(node, rid) if node else frozenset()
-                sides.append(cands)
-                if node is not None:
-                    sid = node["properties"].get("station_id", "")
-                    end_stats[(nid, rid)] = (
-                        "none" if not cands
-                        else "ok" if sid in route_stops.get(rid, {})
-                        else "fallback")
-            fs, ts = sides
+                if node is None:
+                    continue
+                cands = az.resolve_stops(node, rid)
+                sid = node["properties"].get("station_id", "")
+                end_stats[(nid, rid)] = (
+                    "none" if not cands
+                    else "ok" if sid in route_stops.get(rid, {})
+                    else "fallback")
+            fs, ts = sp["sides"]
             if not fs and not ts:
                 n_unknown += 1
                 log(f"freq.py: route {rid}: span of {len(sp['items'])} "
-                    "edge(s) has no resolvable boundary stop; "
+                    "edge(s) found no stops even walking outward; "
                     + ("deferring to smoothing"
                        if cfg.smoothing_enabled and cfg.smoothing_fill_unknown
                        else "assigning no_service"))

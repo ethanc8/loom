@@ -62,11 +62,15 @@ start_time = "10:00"   # HH:MM 24-hour. Times ≥ 24:00 are allowed (GTFS conven
 end_time   = "14:00"   # e.g. a late-evening window may be "22:00" – "26:00".
 
 [metric]
-# How to aggregate inter-trip gaps within the window.
+# How to aggregate inter-trip gaps within the window. The window edges
+# count as gaps (start → first bus, last bus → end), so the gaps tile the
+# whole window and sparse stray trips can't read as frequent service.
 # "max"       – longest gap (worst-case wait; hair-trigger: one odd gap
 #               reclassifies the span it falls in)
-# "mean"      – arithmetic mean of all gaps
-# "median"    – 50th-percentile gap (robust to outliers)
+# "mean"      – arithmetic mean of all gaps ≈ window / (trips + 1)
+# "median"    – time-weighted median: the gap in effect at the typical
+#               minute of the window (robust to outliers without being
+#               fooled by bunched trips in an empty window)
 # "count"     – window duration / number of trips ("buses per hour";
 #               most stable, ignores spacing entirely)
 # "effective" – sum(g²)/sum(g): the average headway experienced by a
@@ -327,33 +331,43 @@ Always validate station_id against `route_stops[route_id]` even when station_id 
 
 Resolution itself is silent (an empty set is *normal* for interior nodes a route passes without stopping); problems are logged at span level in Step 7.
 
+**Candidate sets are for qualification only, never for boundary detection.** A node being within 200 m of some stop does not mean the route stops there: on dense city grids nearly *every* junction node is within 200 m of a stop, so using "candidate set non-empty" as the span-boundary test chops interstations into micro-spans whose slightly different candidate sets compute slightly different headways — visible as a color flip and back *between* two stops whenever the route's headway sits near a bucket edge (observed on cta_62 at the 15-min edge and pace_530 at the 30-min edge). Step 7a.1 uses a strict boundary test instead.
+
 ### Step 7 — Walk each route into stop-to-stop spans; compute headway per span
 
 **Classification is per span, not per graph edge.** Topo nodes are an implementation detail of the graph: they appear at junctions with other routes and at other routes' stops. From the viewer's perspective a route's color must only be able to change at *its own* stops (or where its variants diverge). Coloring individual edges instead produces flapping at invisible junction nodes and false no_service on express corridors whose interior nodes resolve to nothing.
 
 **7a.1 — Build spans.** Group all line entries by `route_id` (a GTFS route_id after C++ Change 1; routes not in `bus_route_ids` or without active trips get no_service wholesale). For each route, collect its edges and walk them into maximal runs bounded by:
-- nodes whose candidate set for this route is **non-empty** (the route stops there),
+- **stop-nodes** of the route — the *strict* test: the node's `station_id` belongs to the route, **or** the node is the **nearest** of the route's own nodes to one of the route's stops (within the 200 m cap; use a coarse lat/lon grid for the nearest-node search). Each stop thus produces about one boundary node; nodes merely *near* a stop stay interior (see the Step 6 note),
 - **branch nodes** of the route's own subgraph (degree ≠ 2 over the route's edges — variants diverge, so frequency may genuinely change),
 - self-loop edges and graph boundaries.
 
-Interior nodes (empty candidate set, degree 2) are walked through. Each span records its edges, its two boundary node ids, and its geometric length in metres (for smoothing).
+Interior nodes are walked through. Each span records its edges, its two boundary node ids, and its geometric length in metres (for smoothing).
 
-**7a.2 — Qualify trips per span.** With `from_stops` / `to_stops` = the boundary nodes' candidate sets:
+**7a.2 — Build each span's two qualification sides, then qualify trips.** A span's *side* is the boundary node's own candidate set **plus the first stop cluster beyond it**: walk outward along the route's subgraph from the end node (skipping the span's own edges, following every branch at branch nodes, never expanding through the span's *other* end), and at the first node whose candidate set adds a stop not in the end's own set, collect that set and stop that path.
+
+This makes qualification a **pass-through test** — a trip that visits both sides has ridden across the span — which the raw candidate sets alone cannot express in two real cases (both observed on the 2026-07 feeds as false no_service between adjacent labelled stops):
+- **Direction-offset stops**: the two directions stop at different locations or differently-named curbs ("Sibley & Greenwood Rd" EB-only vs "Sibley & Greenwood Ave" WB-only; pace_550 SB stops at Miller, NB at Binnie). Each end resolves to one direction's stop only, so no trip visits both raw sets. With walked-out sides, each direction qualifies via the neighboring stop beyond.
+- **Stop-less branch nodes**: median splits and expressway ramps bound spans whose ends resolve to nothing (pace_353's expressway was a mesh of such spans). The outward walk reaches the real entry/exit stops, giving the nonstop section its honest between-stops frequency — no smoothing needed.
+
+Trips that terminate at a boundary stop still fail the far side, so genuine no-service tails (peak-only extensions) stay grey.
+
+With `from_stops` / `to_stops` = the two sides:
 
    **Normal case** (both non-empty, distinct): a trip qualifies if it visits at least one from-candidate **and** one to-candidate as *distinct* stop occurrences (a single visit to a stop the two sets share does not count). Its span-entry departure is the `dep_sec` of its earliest qualifying occurrence.
 
    **Degenerate case** (`from_stops == to_stops`, or exactly one set non-empty): presence-only — every trip serving any stop in the union qualifies, with its departure at its earliest such occurrence. Count degenerate spans in the summary.
 
-   **Both sets empty**: mark the span **unknown** and log it. Unknown spans fall to no_service unless smoothing's `fill_unknown` is on (Step 7b).
+   **Both sides empty** (even after walking outward — an isolated fragment): mark the span **unknown** and log it. Unknown spans fall to no_service unless smoothing's `fill_unknown` is on (Step 7b).
 
 **7a.3 — Group departures by `direction_id`.** Trips lacking a `direction_id` fall back to observed stop order (forward if a from-occurrence precedes the last to-occurrence, else reverse; degenerate spans use a single group). Note the change from earlier revisions: `direction_id` is still never mapped to edge orientation — it is used *only* to partition trips into consistent groups, and the min over groups is taken regardless. Observed-order grouping alone breaks down when the candidate sets overlap (short spans): one-way trips then pass the strict order test in *both* directions, interleaving the two directions' departures in each group and roughly halving the computed headway.
 
 **7a.4 — Window filter and metric** (per group independently):
-   - Keep entry departures with `window_start <= dep_sec < window_end`; sort; `gaps = [t[i+1] - t[i]]`
+   - Keep entry departures with `window_start <= dep_sec < window_end`; sort
    - 0 trips in window → group has no headway
    - `count` metric: `window_dur_min / n_trips` (no gaps needed)
-   - otherwise 1 trip in window → use `window_dur_min` as the headway (conservative)
-   - otherwise apply `max`, `mean`, `median`, or `effective` = `sum(g²)/sum(g)` (also used when all departures coincide: fall back to `window_dur_min`)
+   - otherwise build gaps **including the window edges** so they tile the whole window: `gaps = [first - window_start] + [t[i+1] - t[i]] + [window_end - last]`. Without the edge gaps, a couple of stray trips in an otherwise empty window read as their mutual spacing — cta_169 (peak-only UPS express) has exactly two trips grazing the window 5 minutes apart, which scored `effective = 5 min` and painted an 8 km corridor red; with edge gaps it reads ~200 min. This also naturally covers the single-trip case (its two edge gaps replace the old `window_dur_min` fallback) and penalizes service that dies mid-window.
+   - apply `max`, `mean`, `effective` = `sum(g²)/sum(g)`, or `median` — which is **time-weighted**: sort gaps and take the gap in effect at the half-window mark. A plain median of gaps is robust to outliers, but here the giant empty gap *is* the truth: plain-median of `[4, 5, 231]` is 5 while the time-weighted median is 231.
 
 **7a.5 — Take the minimum across groups**; no groups → no_service. **Assign the bucket** (first `[[buckets]]` entry with `max_headway_min >= headway_min`) to **every edge of the span**.
 
@@ -361,7 +375,7 @@ Interior nodes (empty candidate set, degree 2) are walked through. Each span rec
 
 Runs per route over its span sequence; span adjacency crosses only boundary nodes shared by exactly two spans of the route, so branch points always break runs.
 
-1. **fill_unknown**: unknown spans inherit a neighboring span's bucket across *any* shared boundary node (unknown spans typically sit between branch nodes); if neighbors disagree, take the slower bucket. Iterate to a fixpoint; leftovers fall to no_service.
+1. **fill_unknown**: unknown spans inherit a neighboring span's bucket across *any* shared boundary node; if neighbors disagree, take the slower bucket. Iterate to a fixpoint; leftovers fall to no_service. (Since 7a.2's outward walk, unknown spans are nearly extinct — 0 on the full Chicagoland run — so this is a safety net.)
 2. **Collapse short runs**: partition spans into maximal runs of equal bucket; a run shorter than `min_run_m` with at least two adjacent runs that all agree on one bucket is reassigned to that bucket. Iterate to a fixpoint (merges can cascade).
 
 After processing all routes:
@@ -390,12 +404,12 @@ Bucket ≤10 min:    234 route-segments
 Bucket ≤15 min:    891 route-segments
 ...
 No service bucket: 47 route-segments
-Spans: 23123 across 259 routes
-Span boundaries resolved geographically (invalid/missing station_id): 5685
+Spans: 20109 across 259 routes
+Span boundaries resolved geographically (invalid/missing station_id): 2671
 Span boundaries with no stop within 200 m: 533
-Degenerate (equal/one-sided boundary) spans: 96
-Spans with no resolvable boundary at all: 12
-Smoothing: filled 12 unknown spans (0 left as no_service), collapsed 179 short runs (212 spans)
+Degenerate (equal/one-sided boundary) spans: 173
+Spans with no resolvable boundary at all: 0
+Smoothing: filled 0 unknown spans (0 left as no_service), collapsed 12 short runs (13 spans)
 Route cta_X9: 41 active trips, 39 qualified somewhere, 2 never qualified
 ```
 
