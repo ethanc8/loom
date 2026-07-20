@@ -91,6 +91,20 @@ min_run_m = 400
 # one if neighbors disagree — instead of falling to no_service.
 fill_unknown = true
 
+[matching]
+# Each stop of a route is paired with exactly ONE graph node (Step 6):
+# the node carrying its station_id when valid, else the nearest node of
+# the route's subgraph within this many metres. Stops further than this
+# from every node stay unassigned (counted in the summary log). This is
+# the only distance heuristic in freq.py; span boundaries and trip
+# qualification both derive from the assignment.
+max_stop_node_dist_m = 200
+# How many stop-bearing nodes each outward path collects into a span's
+# qualification side (Step 7a.2). 1 misses the opposite direction where
+# NB/SB stops alternate nodes along a corridor; large values leak around
+# rejoining loops and give branch segments the trunk's frequency.
+qualify_stop_depth = 2
+
 # Frequency buckets, evaluated in order (smallest max_headway_min first).
 # The first bucket where max_headway_min >= computed headway is used.
 # max_headway_min = "inf" is the catch-all (matches any headway).
@@ -299,7 +313,7 @@ route_trips = ...
 bus_route_ids = set(routes[routes["route_type"] == "3"]["route_id"])
 ```
 
-No KD-tree / scipy: route stop sets are at most a few hundred stops, so the geographic fallback in Step 6 brute-forces haversine over `route_stops[route_id]`. This is simpler and avoids the degree-space distortion and "nearest overall stop isn't on this route" problems a global KD-tree has.
+No KD-tree / scipy: route stop sets are at most a few hundred stops, so the nearest-node search in Step 6 uses a coarse per-route lat/lon grid (cell ≥ the assignment cap, 3×3 scan). This is simpler and avoids the degree-space distortion and "nearest overall stop isn't on this route" problems a global KD-tree has.
 
 ### Step 5 — Build node and edge maps from the GeoJSON
 
@@ -308,47 +322,38 @@ node_map = {f["properties"]["id"]: f for f in features if f["geometry"]["type"] 
 edges = [f for f in features if f["geometry"]["type"] == "LineString"]
 ```
 
-### Step 6 — Resolve the candidate stop_ids for a node, given a specific route
+### Step 6 — Assign each stop of a route to exactly one node
 
-Called for the `from` and `to` node of each edge, per route. Memoize on `(node_id, route_id)`. Returns a **(possibly empty) set of stop_ids**, not a single stop:
+Per route: pair every stop with exactly **one** node of the route's subgraph, producing `{node_id: frozenset(stop_ids)}`:
 
-```python
-def resolve_stops(node, route_id) -> frozenset:
-    cands = set()
-    sid = node["properties"].get("station_id", "")
-    if sid and sid in route_stops.get(route_id, {}):
-        cands.add(sid)    # station_id is valid for this route
-    # plus ALL stops of the route within 200 m of the node
-    # (brute-force haversine against route_stops[route_id])
-    ...
-```
+1. the node whose `station_id` equals the stop_id (validated against `route_stops[route_id]` — a node may carry the stop_id of a different route), else
+2. the **nearest** node of the route's subgraph within `[matching] max_stop_node_dist_m` (default 200 m; grid-accelerated), else
+3. **unassigned** (counted in the summary log; qualification still reaches such a stop's neighbors through Step 7a.2's outward walk).
 
-**Why a set** (found empirically on the 2026-07 Chicagoland feeds): the two travel directions of a street use distinct GTFS stops a few metres apart on opposite curbs, and a topo node stands for the whole street corner. Resolving each node to a *single* nearest stop picks a curb arbitrarily; when an edge's two nodes pick opposite curbs (e.g. `pace_226e0245` / `pace_226w0250`), **no single trip visits both stops** and the segment is falsely classified no_service — on the real data this hit 79% of resolved no_service entries and made frequent routes flicker between their color and no_service every few edges. With candidate sets, a trip qualifies if it visits *any* from-candidate and *any* to-candidate (Step 7 merges the occurrence lists per set), which is direction-blind and immune to curb choice.
+This exclusive, topological assignment is the *only* distance heuristic in freq.py, and it drives both span boundaries (7a.1) and qualification sides (7a.2). Two failed alternatives, kept here as design rationale — both used radius **balls** ("all stops within 200 m of a node") and both broke on real data:
 
-**200 m threshold** (not 100 m): suburban Pace routes have stops spaced 500 m–1 km apart; topo intersection nodes can be up to ~150 m from the nearest stop on dense city grids. 200 m provides enough slack while excluding clearly wrong matches. The same radius collects the candidate set; sets of neighboring nodes may overlap — harmless, since qualification only needs strict `stop_sequence` order between a from- and a to-occurrence.
+- **Balls as boundary test**: on dense city grids nearly every junction node is within 200 m of some stop, so "candidate set non-empty" chopped interstations into micro-spans whose slightly different candidate sets computed slightly different headways — a color flip and back *between* two stops whenever the route's headway sat near a bucket edge (cta_62 at the 15-min edge, pace_530 at the 30-min edge).
+- **Balls as qualification sets**: at a branch point the ball around the branch's first nodes swallows geometrically-near trunk stops, so every through trip "visits both sides" of a branch-only segment it never drives — the segment inherits the trunk's combined frequency (pace_802's Airport Rd short-turn loop read the trunk's 28 min instead of the loop's 63; same on pace_571's Zion loop legs and pace_834's Janes Ave split).
 
-Always validate station_id against `route_stops[route_id]` even when station_id is present — a node may carry the stop_id of one route while a different route on the adjacent edge has a nearby-but-distinct stop. A valid station_id does **not** short-circuit the geographic scan: its opposite-curb partner stop must still enter the set.
-
-Resolution itself is silent (an empty set is *normal* for interior nodes a route passes without stopping); problems are logged at span level in Step 7.
-
-**Candidate sets are for qualification only, never for boundary detection.** A node being within 200 m of some stop does not mean the route stops there: on dense city grids nearly *every* junction node is within 200 m of a stop, so using "candidate set non-empty" as the span-boundary test chops interstations into micro-spans whose slightly different candidate sets compute slightly different headways — visible as a color flip and back *between* two stops whenever the route's headway sits near a bucket edge (observed on cta_62 at the 15-min edge and pace_530 at the 30-min edge). Step 7a.1 uses a strict boundary test instead.
+**200 m cap** (not 100 m): suburban Pace stops sit 500 m–1 km apart and topo nodes can be ~150 m from their stop on dense grids; 200 m gives slack while excluding clearly wrong matches. The paired-curb problem that motivated the old ball sets (NB/SB curbs are distinct GTFS stops metres apart — resolving a node to one curb means no single trip visits both ends of a segment) is handled instead by the outward walk in 7a.2, which unions the neighboring assigned stops into each side.
 
 ### Step 7 — Walk each route into stop-to-stop spans; compute headway per span
 
 **Classification is per span, not per graph edge.** Topo nodes are an implementation detail of the graph: they appear at junctions with other routes and at other routes' stops. From the viewer's perspective a route's color must only be able to change at *its own* stops (or where its variants diverge). Coloring individual edges instead produces flapping at invisible junction nodes and false no_service on express corridors whose interior nodes resolve to nothing.
 
-**7a.1 — Build spans.** Group all line entries by `route_id` (a GTFS route_id after C++ Change 1; routes not in `bus_route_ids` or without active trips get no_service wholesale). For each route, collect its edges and walk them into maximal runs bounded by:
-- **stop-nodes** of the route — the *strict* test: the node's `station_id` belongs to the route, **or** the node is the **nearest** of the route's own nodes to one of the route's stops (within the 200 m cap; use a coarse lat/lon grid for the nearest-node search). Each stop thus produces about one boundary node; nodes merely *near* a stop stay interior (see the Step 6 note),
-- **branch nodes** of the route's own subgraph (degree ≠ 2 over the route's edges — variants diverge, so frequency may genuinely change),
-- self-loop edges and graph boundaries.
+**7a.1 — Build spans.** Group all line entries by `route_id` (a GTFS route_id after C++ Change 1; routes not in `bus_route_ids` or without active trips get no_service wholesale). An edge is just a piece of the segment between two adjacent stops: for each route, collect its edges and walk them into maximal runs bounded **only** by
+- nodes with assigned stops (Step 6 — the route stops there), and
+- nodes where the graph leaves no choice: **branch nodes** of the route's own subgraph (degree ≠ 2 over the route's edges — variants diverge, so frequency may genuinely change), self-loop edges, and graph boundaries.
 
-Interior nodes are walked through. Each span records its edges, its two boundary node ids, and its geometric length in metres (for smoothing).
+All other nodes are walked through. Each span records its edges, its two boundary node ids, and its geometric length in metres (for smoothing).
 
-**7a.2 — Build each span's two qualification sides, then qualify trips.** A span's *side* is the boundary node's own candidate set **plus the first stop cluster beyond it**: walk outward along the route's subgraph from the end node (skipping the span's own edges, following every branch at branch nodes, never expanding through the span's *other* end), and at the first node whose candidate set adds a stop not in the end's own set, collect that set and stop that path.
+**7a.2 — Build each span's two qualification sides, then qualify trips.** A span's *side* is the end node's own assigned stops **plus the assigned stops of up to `qualify_stop_depth` stop-nodes per outward path** (default 2): walk outward along the route's subgraph from the end node (skipping the span's own edges, following every branch at branch nodes, never expanding through the span's *other* end), counting each node that contributes new stops toward the path's depth. At a branch node the walk collects all branches' stops; that is safe because the span's other side still filters to trips that actually continue onto this span's leg.
 
-This makes qualification a **pass-through test** — a trip that visits both sides has ridden across the span — which the raw candidate sets alone cannot express in two real cases (both observed on the 2026-07 feeds as false no_service between adjacent labelled stops):
-- **Direction-offset stops**: the two directions stop at different locations or differently-named curbs ("Sibley & Greenwood Rd" EB-only vs "Sibley & Greenwood Ave" WB-only; pace_550 SB stops at Miller, NB at Binnie). Each end resolves to one direction's stop only, so no trip visits both raw sets. With walked-out sides, each direction qualifies via the neighboring stop beyond.
-- **Stop-less branch nodes**: median splits and expressway ramps bound spans whose ends resolve to nothing (pace_353's expressway was a mesh of such spans). The outward walk reaches the real entry/exit stops, giving the nonstop section its honest between-stops frequency — no smoothing needed.
+`qualify_stop_depth` is the recall/locality trade-off, and both failure directions were observed on real data: depth 1 fails on corridors whose consecutive stop-nodes all carry the same direction's stops — the walk ends before it ever meets the opposite direction, and the span reads no_service (pace_559 on IL-59 at New York St, where NB and SB stops alternate nodes). Unlimited depth leaks around loops and one-way couplets that rejoin the trunk, letting other legs' trips qualify and giving branch segments the trunk's combined frequency again. Depth 2 covers alternating curb placement while staying local to the span's leg.
+
+This makes qualification a **pass-through test** — a trip that visits both sides has ridden across the span — which the ends' own stops alone cannot express in two real cases (both observed on the 2026-07 feeds as false no_service between adjacent labelled stops):
+- **Direction-offset stops**: the two directions stop at different locations or differently-named curbs ("Sibley & Greenwood Rd" EB-only vs "Sibley & Greenwood Ave" WB-only; pace_550 SB stops at Miller, NB at Binnie). Each end holds one direction's stop only, so no trip visits both ends. With walked-out sides, each direction qualifies via the neighboring stop beyond.
+- **Stop-less branch nodes**: median splits and expressway ramps bound spans whose ends hold nothing (pace_353's expressway was a mesh of such spans). The outward walk reaches the real entry/exit stops, giving the nonstop section its honest between-stops frequency — no smoothing needed.
 
 Trips that terminate at a boundary stop still fail the far side, so genuine no-service tails (peak-only extensions) stay grey.
 
@@ -405,10 +410,9 @@ Bucket ≤15 min:    891 route-segments
 ...
 No service bucket: 47 route-segments
 Spans: 20109 across 259 routes
-Span boundaries resolved geographically (invalid/missing station_id): 2671
-Span boundaries with no stop within 200 m: 533
+Stop-node assignment (per route x stop): 24575 via station_id, 3010 via nearest node, 517 unassigned (no node within 200 m)
 Degenerate (equal/one-sided boundary) spans: 173
-Spans with no resolvable boundary at all: 0
+Spans with no reachable stop on either side: 0
 Smoothing: filled 0 unknown spans (0 left as no_service), collapsed 12 short runs (13 spans)
 Route cta_X9: 41 active trips, 39 qualified somewhere, 2 never qualified
 ```

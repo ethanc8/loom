@@ -35,6 +35,20 @@ min_run_m = 400
 # bucket (the slower one if neighbors disagree) instead of no_service.
 fill_unknown = true
 
+[matching]
+# Each stop of a route is paired with exactly ONE graph node: the node
+# carrying its station_id when valid, else the nearest node of the route's
+# subgraph within this many metres. Stops further than this from every
+# node stay unassigned (counted in the summary log). This is the only
+# distance heuristic in freq.py; span boundaries and trip qualification
+# both derive from the assignment.
+max_stop_node_dist_m = 200
+# How many stop-bearing nodes each outward path collects into a span's
+# qualification side. 1 misses the opposite direction where NB/SB stops
+# alternate nodes along a corridor (false no_service); large values leak
+# around rejoining loops and give branch segments the trunk's frequency.
+qualify_stop_depth = 2
+
 # Frequency buckets, evaluated in order (smallest max_headway_min first).
 # The first bucket where max_headway_min >= computed headway is used.
 # max_headway_min = "inf" is the catch-all (matches any headway).

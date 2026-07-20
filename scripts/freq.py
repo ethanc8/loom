@@ -6,17 +6,25 @@ per stop-to-stop span within a configured time window from GTFS, assigns
 every (edge, route) pair a frequency bucket, and writes the modified GeoJSON
 to stdout.
 
-Classification is per SPAN, not per graph edge: for each route, its edges
-are walked into maximal runs bounded by nodes that stand for stops of that
-route (strictly: valid station_id or nearest node to a stop) or by branch
-nodes of the route's subgraph. All edges of a span get the span's bucket,
-so a route's color can only change at its own stops or where variants
-diverge — never at other routes' stops or junction nodes, which are
-implementation details of the graph. A trip counts toward a span if it
-traverses it — it visits stops on both sides, where each side includes
-the neighboring stops just beyond the span's ends. Departures are grouped
-by GTFS direction_id (observed stop order for trips without one) and the
-headway is the min over groups.
+Classification is per SPAN, not per graph edge. Three principles:
+
+1. An edge is just a piece of the segment between two adjacent stops of
+   the route. Spans are maximal edge runs bounded only by nodes that
+   stand for the route's stops and by nodes where the graph leaves no
+   choice (branch nodes of the route's own subgraph, self-loops, graph
+   boundaries); all other nodes — junctions, other routes' stops — are
+   implementation details and are walked through.
+2. Each stop is paired with exactly ONE node (assign_stops): the node
+   carrying its station_id when valid, else the nearest node of the
+   route's subgraph within [matching] max_stop_node_dist_m. This single
+   assignment drives both span boundaries and trip qualification; no
+   radius-based candidate sets exist anywhere.
+3. A trip counts toward a span if it traverses it — it visits stops on
+   both sides, where each side is the end's own assigned stops plus the
+   first assigned stops beyond it (span_sides).
+
+Departures are grouped by GTFS direction_id (observed stop order for
+trips without one) and the headway is the min over groups.
 
 On every line entry it sets:
 
@@ -45,9 +53,7 @@ from datetime import date as _date, datetime
 import pandas as pd
 
 NO_SERVICE = -1  # sentinel bucket index
-UNKNOWN = -2     # span with no resolvable boundary stop on either end
-
-FALLBACK_MAX_DIST_M = 200.0
+UNKNOWN = -2     # span with no reachable stop on either side
 
 
 def log(msg):
@@ -106,6 +112,13 @@ class Config:
         self.smoothing_enabled = bool(sm.get("enabled", False))
         self.smoothing_min_run_m = float(sm.get("min_run_m", 400.0))
         self.smoothing_fill_unknown = bool(sm.get("fill_unknown", True))
+
+        mt = cfg.get("matching", {})
+        self.max_stop_node_dist_m = float(
+            mt.get("max_stop_node_dist_m", 200.0))
+        self.qualify_stop_depth = int(mt.get("qualify_stop_depth", 2))
+        if self.qualify_stop_depth < 1:
+            sys.exit("freq.py: qualify_stop_depth must be >= 1")
 
         # [(max_headway_min, color-or-None), ...] in config order
         self.buckets = []
@@ -282,40 +295,9 @@ class FreqAnalyzer:
         self.bus_route_ids = bus_route_ids
         self.trip_dir = trip_dir
 
-        self._resolve_memo = {}
         self._headway_memo = {}
 
         self.route_qualified = {}  # route_id -> set of trip_ids
-
-    def resolve_stops(self, node, route_id):
-        """Candidate stop_ids of `node` on `route_id` as a (possibly empty)
-        frozenset: the node's station_id if it belongs to the route, plus
-        every stop of the route within FALLBACK_MAX_DIST_M. A set, not a
-        single stop: the two directions of a street use distinct GTFS stops
-        a few metres apart, and a topo node stands for the whole street
-        corner — resolving to one curb arbitrarily means no single trip
-        visits both stops. An empty set is normal for interior nodes the
-        route passes without stopping. Memoized."""
-        node_id = node["properties"].get("id")
-        key = (node_id, route_id)
-        if key in self._resolve_memo:
-            return self._resolve_memo[key]
-
-        stops_of_route = self.route_stops.get(route_id, {})
-        cands = set()
-
-        sid = node["properties"].get("station_id", "")
-        if sid and sid in stops_of_route:
-            cands.add(sid)
-
-        lon, lat = node["geometry"]["coordinates"]
-        for cand, (clat, clon) in stops_of_route.items():
-            if haversine_m(lat, lon, clat, clon) < FALLBACK_MAX_DIST_M:
-                cands.add(cand)
-
-        res = frozenset(cands)
-        self._resolve_memo[key] = res
-        return res
 
     def _mark_qualified(self, route_id, trip_id):
         self.route_qualified.setdefault(route_id, set()).add(trip_id)
@@ -422,37 +404,35 @@ def geom_length_m(coords):
                for a, b in zip(coords, coords[1:]))
 
 
-def build_spans(route_id, items, node_map, az):
-    """Group a route's (edge, line_entry) items into stop-to-stop spans.
-
-    A span is a maximal run of the route's edges bounded by nodes that
-    stand for stops of the route, by branch nodes of the route's subgraph
-    (degree != 2), or by self-loop edges. Interior nodes — junctions and
-    other routes' stops — are walked through, so a route's bucket can only
-    change where it actually stops or where variants diverge.
-
-    The boundary test is strict: a node stands for a stop only if its
-    station_id belongs to the route, or it is the NEAREST of the route's
-    nodes to one of its stops (within FALLBACK_MAX_DIST_M). Being merely
-    within the fallback radius of some stop is not enough — in dense
-    networks nearly every junction node is, and using that as the boundary
-    test chops interstations into micro-spans whose jittery headways can
-    straddle a bucket edge mid-segment. The generous radius remains right
-    for qualification (see span_sides).
-
-    Returns a list of dicts: {"items", "ends" (two node ids), "sides"
-    (two frozensets of qualification stop_ids), "length_m"}.
-    """
+def route_adjacency(items):
+    """{node_id: [(edge, line_entry), ...]} over one route's edges."""
     adj = {}
     for it in items:
         p = it[0]["properties"]
         for nid in (p.get("from"), p.get("to")):
             adj.setdefault(nid, []).append(it)
+    return adj
 
-    stops_of_route = az.route_stops.get(route_id, {})
 
+def assign_stops(route_id, adj, node_map, route_stops, max_dist_m, stats):
+    """Pair each stop of the route with exactly ONE node of the route's
+    subgraph: the node carrying its station_id when that is valid for the
+    route, else the nearest node within max_dist_m (config [matching]
+    max_stop_node_dist_m). Returns {node_id: frozenset(stop_ids)}.
+
+    The assignment is exclusive and topological — no radius-based
+    candidate sets exist anywhere. A ball around a node would swallow
+    geometrically-near stops of other branches at junctions, which made
+    branch-only segments inherit the trunk's combined frequency (pace_802
+    at Airport Rd, pace_571's Zion loop, pace_834's Janes Ave split), and
+    as a boundary test it chopped interstations into micro-spans. A stop
+    with no node within max_dist_m stays unassigned (counted in stats);
+    trips still qualify through it wherever the outward walk of
+    span_sides reaches its neighbors.
+    """
+    stops = route_stops.get(route_id, {})
     node_pos = {}
-    stop_nodes = set()
+    by_station = {}
     for nid in adj:
         node = node_map.get(nid)
         if node is None:
@@ -460,40 +440,69 @@ def build_spans(route_id, items, node_map, az):
         lon, lat = node["geometry"]["coordinates"]
         node_pos[nid] = (lat, lon)
         sid = node["properties"].get("station_id", "")
-        if sid and sid in stops_of_route:
-            stop_nodes.add(nid)
+        if sid and sid in stops and sid not in by_station:
+            by_station[sid] = nid
 
-    cell = 0.003  # ~330 m grid for the nearest-node search
+    # grid cell >= max_dist in both axes so a 3x3 scan covers the radius
+    cell = max(max_dist_m, 1.0) * 2.0 / 111000.0
     grid = {}
     for nid, (lat, lon) in node_pos.items():
         grid.setdefault((math.floor(lat / cell), math.floor(lon / cell)),
                         []).append(nid)
-    for sid, (slat, slon) in stops_of_route.items():
-        ci, cj = math.floor(slat / cell), math.floor(slon / cell)
-        best, bd = None, FALLBACK_MAX_DIST_M
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                for nid in grid.get((ci + di, cj + dj), ()):
-                    nlat, nlon = node_pos[nid]
-                    d = haversine_m(slat, slon, nlat, nlon)
-                    if d < bd:
-                        best, bd = nid, d
-        if best is not None:
-            stop_nodes.add(best)
 
+    assigned = {}
+    for sid, (slat, slon) in stops.items():
+        nid = by_station.get(sid)
+        how = "station_id"
+        if nid is None:
+            how = "nearest"
+            ci, cj = math.floor(slat / cell), math.floor(slon / cell)
+            best, bd = None, max_dist_m
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    for cand in grid.get((ci + di, cj + dj), ()):
+                        nlat, nlon = node_pos[cand]
+                        d = haversine_m(slat, slon, nlat, nlon)
+                        if d < bd:
+                            best, bd = cand, d
+            nid = best
+        if nid is None:
+            stats["unassigned"] += 1
+            continue
+        stats[how] += 1
+        assigned.setdefault(nid, set()).add(sid)
+    return {nid: frozenset(s) for nid, s in assigned.items()}
+
+
+def build_spans(route_id, items, node_map, adj, assigned, side_depth):
+    """Group a route's (edge, line_entry) items into stop-to-stop spans.
+
+    An edge is just a piece of the segment between two adjacent stops of
+    the route: spans are maximal edge runs bounded only by nodes with
+    assigned stops (the route stops there) and by nodes where the graph
+    leaves no choice — branch nodes of the route's own subgraph
+    (degree != 2 over the route's edges: variants diverge, so frequency
+    may genuinely change), self-loop edges, and graph boundaries. All
+    other nodes — junctions, other routes' stops — are walked through, so
+    a route's bucket can only change at its own stops or where variants
+    diverge.
+
+    Returns a list of dicts: {"items", "ends" (two node ids), "sides"
+    (two frozensets of qualification stop_ids), "length_m"}.
+    """
     def is_boundary(nid):
         if nid is None or nid not in node_map:
             return True
         if len(adj.get(nid, ())) != 2:
             return True
-        return nid in stop_nodes
+        return nid in assigned
 
-    spans, assigned = [], set()
+    spans, used = [], set()
     for it in items:
-        if id(it[1]) in assigned:
+        if id(it[1]) in used:
             continue
         span_items = [it]
-        assigned.add(id(it[1]))
+        used.add(id(it[1]))
         ends = []
         for side in (0, 1):
             p = it[0]["properties"]
@@ -502,11 +511,11 @@ def build_spans(route_id, items, node_map, az):
                 ends.append(nid)
                 continue
             while not is_boundary(nid):
-                nxt = [x for x in adj[nid] if id(x[1]) not in assigned]
+                nxt = [x for x in adj[nid] if id(x[1]) not in used]
                 if not nxt:
-                    break  # closed ring: back at an already-assigned edge
+                    break  # closed ring: back at an already-used edge
                 x = nxt[0]
-                assigned.add(id(x[1]))
+                used.add(id(x[1]))
                 span_items.append(x)
                 q = x[0]["properties"]
                 if q.get("from") == q.get("to"):
@@ -518,37 +527,48 @@ def build_spans(route_id, items, node_map, az):
         spans.append({"items": span_items, "ends": ends,
                       "length_m": length})
     for sp in spans:
-        sp["sides"] = span_sides(route_id, sp, adj, node_map, az)
+        sp["sides"] = span_sides(sp, adj, assigned, side_depth)
     return spans
 
 
-def span_sides(route_id, sp, adj, node_map, az):
-    """The two qualification stop sets of a span: each end's own candidates
-    plus, walking outward along the route's subgraph (away from the span,
-    down every branch, never through the span's other end), the first stop
-    cluster beyond it.
+def span_sides(sp, adj, assigned, depth):
+    """The two qualification stop sets of a span: each end's own assigned
+    stops plus, walking outward along the route's subgraph (away from the
+    span, down every branch, never through the span's other end), the
+    assigned stops of up to `depth` stop-nodes per outward path
+    (config [matching] qualify_stop_depth).
 
-    A trip visiting both sides has traversed the span. The plain per-node
-    candidate sets are not enough for that test: where the two directions
-    stop at different curbs or offset locations, each end resolves to one
-    direction's stop only and no single trip visits both ("Sibley &
-    Greenwood Rd" eastbound vs "Sibley & Greenwood Ave" westbound); and a
-    median split or expressway ramp bounds spans with stop-less branch
-    nodes that resolve to nothing at all. Walking out to the neighboring
-    stops makes both cases qualify exactly the trips that ride across.
-    Trips that terminate at a boundary stop still fail the far side."""
+    A trip visiting both sides has traversed the span. The ends' own
+    stops are not enough for that test: where the two directions stop at
+    offset locations, each end holds one direction's stop only and no
+    single trip visits both ("Sibley & Greenwood Rd" eastbound vs
+    "Sibley & Greenwood Ave" westbound); and a median split or expressway
+    ramp bounds spans with stop-less branch nodes. Walking out to the
+    neighboring stops makes both cases qualify exactly the trips that
+    ride across.
+
+    `depth` is the recall/locality trade-off. Collecting only the first
+    stop-node per path (depth 1) fails on corridors whose consecutive
+    nodes all carry the same direction's stops — the walk ends before it
+    ever meets the opposite direction (pace_559 on IL-59 at New York St).
+    Walking without limit leaks around loops and one-way couplets that
+    rejoin the trunk, letting trips of other legs qualify and giving
+    branch segments the trunk's combined frequency again. depth 2 covers
+    alternating curb placement while staying local to the span's leg.
+    Trips that terminate at a boundary stop still fail the far side, so
+    genuine no-service tails stay grey. At a branch node the walk follows
+    all branches; that is safe because the span's other side still
+    filters to trips that actually continue onto this span's leg."""
     span_ids = {id(it[1]) for it in sp["items"]}
     ends = sp["ends"]
     sides = []
     for i, end in enumerate(ends):
         other = ends[1 - i] if ends[0] != ends[1] else None
-        node = node_map.get(end)
-        base = az.resolve_stops(node, route_id) if node else frozenset()
-        collected = set(base)
+        collected = set(assigned.get(end, frozenset()))
         seen = {end}
-        queue = [end]
+        queue = [(end, 0)]  # (node, stop-nodes passed on this path)
         while queue:
-            nid = queue.pop()
+            nid, lvl = queue.pop()
             for it in adj.get(nid, ()):
                 if id(it[1]) in span_ids:
                     continue
@@ -557,14 +577,13 @@ def span_sides(route_id, sp, adj, node_map, az):
                 if nxt in seen or nxt == other:
                     continue
                 seen.add(nxt)
-                nnode = node_map.get(nxt)
-                if nnode is None:
-                    continue
-                cands = az.resolve_stops(nnode, route_id)
-                if cands - base:
-                    collected |= cands  # next stop cluster; end this path
+                cands = assigned.get(nxt, frozenset())
+                if cands - collected:
+                    collected |= cands
+                    if lvl + 1 < depth:
+                        queue.append((nxt, lvl + 1))
                 else:
-                    queue.append(nxt)
+                    queue.append((nxt, lvl))
         sides.append(frozenset(collected))
     return sides
 
@@ -697,7 +716,7 @@ def main():
     entry_bucket = {}  # id(entry) -> final bucket idx
     route_best = {}    # route_id -> best (lowest) final bucket idx
     n_spans = n_degenerate = n_unknown = 0
-    end_stats = {}     # (node_id, route_id) -> "ok" | "fallback" | "none"
+    assign_stats = {"station_id": 0, "nearest": 0, "unassigned": 0}
     smooth_stats = {"filled": 0, "unknown_left": 0,
                     "collapsed_runs": 0, "collapsed_spans": 0}
 
@@ -706,19 +725,13 @@ def main():
             for _, entry in items:
                 entry_bucket[id(entry)] = NO_SERVICE
             continue
-        spans = build_spans(rid, items, node_map, az)
+        adj = route_adjacency(items)
+        assigned = assign_stops(rid, adj, node_map, route_stops,
+                                cfg.max_stop_node_dist_m, assign_stats)
+        spans = build_spans(rid, items, node_map, adj, assigned,
+                            cfg.qualify_stop_depth)
         n_spans += len(spans)
         for sp in spans:
-            for nid in sp["ends"]:
-                node = node_map.get(nid)
-                if node is None:
-                    continue
-                cands = az.resolve_stops(node, rid)
-                sid = node["properties"].get("station_id", "")
-                end_stats[(nid, rid)] = (
-                    "none" if not cands
-                    else "ok" if sid in route_stops.get(rid, {})
-                    else "fallback")
             fs, ts = sp["sides"]
             if not fs and not ts:
                 n_unknown += 1
@@ -834,15 +847,14 @@ def main():
     vis = "" if cfg.no_service_color is not None else " (invisible)"
     log(f"No service bucket:{vis} "
         f"{bucket_counts.get(NO_SERVICE, 0)} route-segments")
-    n_fallback = sum(1 for v in end_stats.values() if v == "fallback")
-    n_unresolved = sum(1 for v in end_stats.values() if v == "none")
     log(f"Spans: {n_spans} across {len(route_entries)} routes")
-    log(f"Span boundaries resolved geographically (invalid/missing "
-        f"station_id): {n_fallback}")
-    log(f"Span boundaries with no stop within {FALLBACK_MAX_DIST_M:.0f} m: "
-        f"{n_unresolved}")
+    log(f"Stop-node assignment (per route x stop): "
+        f"{assign_stats['station_id']} via station_id, "
+        f"{assign_stats['nearest']} via nearest node, "
+        f"{assign_stats['unassigned']} unassigned (no node within "
+        f"{cfg.max_stop_node_dist_m:.0f} m)")
     log(f"Degenerate (equal/one-sided boundary) spans: {n_degenerate}")
-    log(f"Spans with no resolvable boundary at all: {n_unknown}")
+    log(f"Spans with no reachable stop on either side: {n_unknown}")
     if cfg.smoothing_enabled:
         log(f"Smoothing: filled {smooth_stats['filled']} unknown spans "
             f"({smooth_stats['unknown_left']} left as no_service), "
